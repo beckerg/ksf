@@ -1,0 +1,5 @@
+*.[oa]
+*~
+*.out
+.*.d
+cscope.files
