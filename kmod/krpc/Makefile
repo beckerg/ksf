@@ -16,6 +16,7 @@ CFLAGS	+= -I../lib
 
 CLEANFILES += cscope.* TAGS ${KMOD}.objdump .depend.*.o
 CSCOPE_DIRS ?= . ${VPATH} /usr/src/lib /usr/src/sys
+CTAGS = true
 
 .PHONY:	cscope etags tags objdump
 
