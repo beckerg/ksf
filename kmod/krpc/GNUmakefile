@@ -1,0 +1,5 @@
+
+.PHONY: all ${MAKECMDGOALS}
+
+all ${MAKECMDGOALS}:
+	make ${MAKECMDGOALS}
