@@ -57,6 +57,7 @@
 #include "xx.h"
 #include "tdp.h"
 #include "svc.h"
+#include "ksf.h"
 
 MALLOC_DEFINE(M_XX_KRPC2, "krpc2", "krpc2 service");
 
@@ -75,6 +76,7 @@ krpc_recv(struct xx_conn *conn)
     struct socket *so = conn->so;
     struct mbuf *m = NULL;
     struct uio uio;
+    u_int len;
     int flags;
     int rc;
 
@@ -94,6 +96,19 @@ krpc_recv(struct xx_conn *conn)
 
         return;
     }
+
+    if (conn->mrx) {
+        m_cat(conn->mrx, m);
+    } else {
+        conn->mrx = m;
+    }
+
+    len = m_length(conn->mrx, NULL);
+    if (len < RM_SZ)
+        return;
+
+    m = conn->mrx;
+    conn->mrx = NULL;
 
     rc = sosend(so, NULL, NULL, m, NULL, 0, curthread);
     if (rc) {

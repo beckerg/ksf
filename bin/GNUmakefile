@@ -1,4 +1,4 @@
-SUBDIRS = echotest
+SUBDIRS = rpctest echotest
 
 .PHONY: all ${SUBDIRS} ${MAKECMDGOALS}
 

@@ -52,6 +52,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <sys/endian.h>
 
 #include <rpc/types.h>
 #include <rpc/auth.h>
@@ -63,6 +64,7 @@
 
 #include "main.h"
 #include "clp.h"
+#include "ksf.h"
 
 char version[] = PROG_VERSION;
 char *progname;
@@ -74,11 +76,11 @@ FILE *eprint_fp;
 pthread_barrier_t bar_start;
 pthread_barrier_t bar_end;
 unsigned int jobs = 1;
-in_port_t port = 60007;
+in_port_t port = 60111;
 long duration = 600;
 u_long msgcnt = 300000;
 size_t msglag = 128;
-size_t msglen = 1;
+size_t msglen = RM_SZ + 8;
 char *host;
 bool async;
 
@@ -126,7 +128,7 @@ asrtest(int fd, struct tdargs *tdargs)
     char *rxbuf, *txbuf, errbuf[128];
     ssize_t rxlen, txlen, txfrag, txfragmax, cc;
     int rxflags, txflags;
-    long msgrx, msgtx;
+    u_long msgrx, msgtx;
     int rc;
 
     rxbuf = tdargs->rxbuf;
@@ -139,9 +141,12 @@ asrtest(int fd, struct tdargs *tdargs)
     rc = 0;
 
     txfragmax = 8192;
-    if (txfragmax > msglen)
-        txfragmax = msglen;
+    if (txfragmax > txlen)
+        txfragmax = txlen;
     txfrag = txfragmax;
+
+    *(uint32_t *)txbuf = htonl((msglen - RM_SZ) | 0x80000000u);
+    *(uint64_t *)(txbuf + RM_SZ) = htonll(msgtx);
 
     while (msgrx < msgcnt) {
         if (msgtx < msgcnt && msgtx - msgrx < msglag) {
@@ -160,6 +165,8 @@ asrtest(int fd, struct tdargs *tdargs)
                 if (txlen == 0) {
                     txlen = msglen;
                     ++msgtx;
+
+                    *(uint64_t *)(txbuf + RM_SZ) = htonll(msgtx);
                 }
 
                 txfrag -= cc;
@@ -187,8 +194,35 @@ asrtest(int fd, struct tdargs *tdargs)
 
         rxlen -= cc;
         if (rxlen == 0) {
+            uint32_t rm = ntohl( *(uint32_t *)rxbuf );
+            u_long msgid = ntohll( *(uint64_t *)(rxbuf + RM_SZ) );
+            size_t rmlen;
+            bool rmlast;
+
             rxlen = msglen;
             ++msgrx;
+
+            rmlast = RM_ISLAST(rm);
+            if (!rmlast) {
+                eprint("invalid record mark frag, expected %u, got %u, msgrx %lu\n",
+                       rm | 0x80000000u, rm, msgrx);
+                break;
+            }
+
+            rmlen = RM_LEN(rm);
+            if (rmlen != msglen - RM_SZ) {
+                eprint("invalid record mark length, expected %zu, got %zu, msgrx %lu\n",
+                       (msglen - RM_SZ), rmlen, msgrx);
+                break;
+            }
+
+            if (msgid != msgrx - 1) {
+                eprint("invalid msgrx, expected %lu, got %lu, rxlen %zu, cc %ld\n",
+                       msgrx - 1, msgid, rxlen, cc);
+                break;
+            }
+
+            *(uint64_t *)rxbuf = 0;
         }
     }
 
@@ -443,8 +477,8 @@ main(int argc, char **argv)
         msglag = 1;
     if (msgcnt < 1)
         msgcnt = 1;
-    if (msglen < 1)
-        msglen = 1;
+    if (msglen < RM_SZ + 8)
+        msglen = RM_SZ + 8;
 
     rxbufsz = roundup(msglen, 4096) * 2 * jobs;
     rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);

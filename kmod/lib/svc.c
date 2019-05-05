@@ -95,6 +95,7 @@ xx_conn_rele(struct xx_conn *conn)
 
     soclose(conn->so);
     free(conn->laddr, M_SONAME);
+    m_freem(conn->mrx);
 
     conn->magic = NULL;
     free(conn, M_XX_CONN);

@@ -23,36 +23,24 @@
  * SUCH DAMAGE.
  */
 
-#ifndef XX_SVC_H
-#define XX_SVC_H
+#ifndef KSF_H
+#define KSF_H
 
-struct xx_conn;
-typedef void xx_conn_cb_t(struct xx_conn *);
+/* Record mark for RPC message framing.
+ */
+#define RM_SZ           (4)
+#define RM_ISLAST(_rm)  ((_rm) & 0x80000000u)
+#define RM_SETLAST(_rm) ((_rm) | 0x80000000u)
+#define RM_LEN(_rm)     ((_rm) & ~0x80000000u)
 
-struct xx_conn {
-    struct xx_tdp_work      work;
-    u_long                  nsoupcalls;
-    u_long                  ncallbacks;
-    int                     refcnt;
-    bool                    active;
-    void                   *magic;
+#ifndef ntohll
+#define ntohll(_x)  be64toh(_x)
+#endif
 
-    xx_conn_cb_t           *recv;
-    struct xx_svc          *svc;
+#ifndef htonll
+#define htonll(_x)  htobe64(_x)
+#endif
 
-    struct socket          *so;
-    struct mbuf            *mrx;
-    void                   *priv;
 
-    struct sockaddr        *laddr;
-    TAILQ_ENTRY(xx_conn)    connq_entry;
-} __aligned(CACHE_LINE_SIZE);
 
-int xx_conn_hold(struct xx_conn *conn);
-void xx_conn_rele(struct xx_conn *conn);
-
-int xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port, xx_conn_cb_t *recv);
-int xx_svc_create(struct xx_svc **svcp);
-int xx_svc_shutdown(struct xx_svc *svc);
-
-#endif /* XX_SVC_H */
+#endif /* KSF_H */
