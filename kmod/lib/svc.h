@@ -35,23 +35,33 @@ struct xx_conn {
     u_long                  ncallbacks;
     int                     refcnt;
     bool                    active;
+    size_t                  privsz;
     void                   *magic;
 
-    xx_conn_cb_t           *recv;
     struct xx_svc          *svc;
+    xx_conn_cb_t           *recv_cb;
+    xx_conn_cb_t           *destroy_cb;
 
     struct socket          *so;
-    struct mbuf            *mrx;
-    void                   *priv;
-
     struct sockaddr        *laddr;
     TAILQ_ENTRY(xx_conn)    connq_entry;
-} __aligned(CACHE_LINE_SIZE);
+
+    __aligned(CACHE_LINE_SIZE)
+    char                    priv[];
+};
+
+static inline void *
+xx_conn_priv(struct xx_conn *conn)
+{
+    return conn->priv;
+}
 
 int xx_conn_hold(struct xx_conn *conn);
 void xx_conn_rele(struct xx_conn *conn);
 
-int xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port, xx_conn_cb_t *recv);
+int xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port,
+                  xx_conn_cb_t *accept_cb, xx_conn_cb_t *recv_cb,
+                  xx_conn_cb_t *destroy_cb, size_t privsz);
 int xx_svc_create(struct xx_svc **svcp);
 int xx_svc_shutdown(struct xx_svc *svc);
 

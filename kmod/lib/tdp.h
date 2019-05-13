@@ -32,11 +32,11 @@ struct xx_tdp_work;
 typedef void xx_tdp_work_cb_t(struct xx_tdp_work *);
 
 struct xx_tdp_work {
-    TAILQ_ENTRY(xx_tdp_work)    wqe;
+    STAILQ_ENTRY(xx_tdp_work)    wqe;
 
     struct xx_tdp      *tdp;
     xx_tdp_work_cb_t   *func;
-    void               *arg;
+    void               *argv[4];
 };
 
 void xx_tdp_enqueue(struct xx_tdp_work *work, int cpu);

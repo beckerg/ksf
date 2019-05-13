@@ -9,6 +9,7 @@ VPATH = ../lib
 
 .include <bsd.kmod.mk>
 
+CFLAGS	+= -DKSF_MOD=${KMOD} -DKSF_MOD_NAME=\"${KMOD}\"
 CFLAGS	+= -I../lib
 #CFLAGS	+= -DINVARIANTS
 #CFLAGS	+= -DDIAGNOSTIC
@@ -18,7 +19,9 @@ CLEANFILES += cscope.* TAGS ${KMOD}.objdump .depend.*.o
 CSCOPE_DIRS ?= . ${VPATH} /usr/src/lib /usr/src/sys
 CTAGS = true
 
-.PHONY:	cscope etags tags objdump
+.PHONY:	clobber cscope etags tags objdump
+
+clobber: clean
 
 cscope: cscope.out
 

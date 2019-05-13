@@ -29,34 +29,27 @@
 #include <sys/kernel.h>
 #include <sys/kthread.h>
 #include <sys/lock.h>
-#include <sys/malloc.h>
 #include <sys/mutex.h>
-#include <sys/sx.h>
-#include <sys/rmlock.h>
-#include <sys/rwlock.h>
 #include <sys/proc.h>
 #include <sys/condvar.h>
 #include <sys/sched.h>
-#include <vm/uma.h>
 #include <sys/unistd.h>
-#include <machine/stdarg.h>
 #include <sys/sysctl.h>
-#include <sys/smp.h>
 #include <sys/cpuset.h>
-#include <sys/sbuf.h>
-#include <sys/mman.h>
-#include <sys/module.h>
-#include <netinet/in.h>
 #include <sys/uio.h>
+#include <vm/uma.h>
 
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 
 #include "xx.h"
 #include "tdp.h"
 #include "svc.h"
+
+MODULE_VERSION(kecho, 1);
 
 MALLOC_DEFINE(M_XX_KECHO, "kecho", "kecho service");
 
@@ -69,25 +62,46 @@ SYSCTL_UINT(_debug_kecho, OID_AUTO, debug,
             &xx_debug, 0,
             "Show debug tracing on console");
 
+struct conn_priv {
+    struct mbuf *hdr;
+};
+
+/* The tcp destroy callback is called once all the references
+ * to conn have been release, prior to socket close.  This
+ * is where we teardown the connection private data.
+ */
 static void
-kecho_recv(struct xx_conn *conn)
+kecho_destroy_cb(struct xx_conn *conn)
 {
+    struct conn_priv *priv = xx_conn_priv(conn);
+
+    m_freem(priv->hdr);
+}
+
+static void
+kecho_recv_tcp(struct xx_conn *conn)
+{
+    struct conn_priv *priv = xx_conn_priv(conn);
     struct socket *so = conn->so;
     struct mbuf *m = NULL;
+    int rcvpercall = 8;
+    struct mbuf *h;
     struct uio uio;
     int flags;
     int rc;
 
+  again:
+    uio.uio_resid = IP_MAXPACKET;
     uio.uio_td = curthread;
-    uio.uio_resid = 1024 * 16;
     flags = MSG_DONTWAIT;
+    m = NULL;
 
     rc = soreceive(so, NULL, &uio, &m, NULL, &flags);
 
     if (rc || !m) {
-        dprint("conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-               conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
         if (rc != EWOULDBLOCK) {
+            dprint("soreceive: tcp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
+                   conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
             conn->active = false;
             xx_conn_rele(conn);
         }
@@ -95,64 +109,126 @@ kecho_recv(struct xx_conn *conn)
         return;
     }
 
-    rc = sosend(so, NULL, NULL, m, NULL, 0, curthread);
+    h = priv->hdr;
+    if (!h)
+        h = m_gethdr(M_WAITOK, MT_DATA);
+    h->m_next = m;
+    m_fixhdr(h);
+
+    rc = sosend(so, NULL, NULL, h, NULL, 0, curthread);
     if (rc) {
-        eprint("sosend: conn %p, resid %zu, rc %d\n",
-               conn, uio.uio_resid, rc);
+        dprint("sosend: tcp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
+               conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
         conn->active = false;
         xx_conn_rele(conn);
     }
+
+    priv->hdr = m_gethdr(M_NOWAIT, MT_DATA);
+
+    if (--rcvpercall > 0)
+        goto again;
+}
+
+static void
+kecho_recv_udp(struct xx_conn *conn)
+{
+    struct conn_priv *priv = xx_conn_priv(conn);
+    struct socket *so = conn->so;
+    struct sockaddr *faddr;
+    int rcvpercall = 8;
+    struct mbuf *m;
+    struct mbuf *h;
+    struct uio uio;
+    int flags;
+    int rc;
+
+  again:
+    uio.uio_resid = IP_MAXPACKET;
+    uio.uio_td = curthread;
+    flags = MSG_DONTWAIT;
+    faddr = NULL;
+    m = NULL;
+
+    rc = soreceive(so, &faddr, &uio, &m, NULL, &flags);
+
+    if (rc || !m) {
+        if (rc != EWOULDBLOCK) {
+            dprint("soreceive: udp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
+                   conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+            conn->active = false;
+            xx_conn_rele(conn);
+        }
+
+        return;
+    }
+
+    h = priv->hdr;
+    if (!h)
+        h = m_gethdr(M_WAITOK, MT_DATA);
+    h->m_next = m;
+    m_fixhdr(h);
+
+    rc = sosend(so, faddr, NULL, h, NULL, 0, curthread);
+    if (rc) {
+        dprint("sosend: udp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
+               conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+        conn->active = false;
+        xx_conn_rele(conn);
+    }
+
+    free(faddr, M_SONAME);
+
+    priv->hdr = m_gethdr(M_NOWAIT, MT_DATA);
+
+    if (--rcvpercall > 0)
+        goto again;
 }
 
 static struct xx_svc *kecho_svc;
 
-static int
-xx_modevent(module_t mod, int cmd, void *data)
+int
+kecho_mod_load(module_t mod, int cmd, void *data)
 {
     const char *host = "0.0.0.0";
     in_port_t port = 60007;
     struct xx_svc *svc;
     int rc;
 
-    switch (cmd) {
-    case MOD_LOAD:
-        rc = xx_svc_create(&svc);
-        if (rc) {
-            eprint("xx_svc_create() failed: %d\n", rc);
-            break;
-        }
-
-        rc = xx_svc_listen(svc, SOCK_STREAM, host, port, kecho_recv);
-        if (rc) {
-            eprint("xx_lsn_create() failed: %d\n", rc);
-            xx_svc_shutdown(svc);
-            break;
-        }
-
-        kecho_svc = svc;
-        break;
-
-    case MOD_UNLOAD:
-        rc = xx_svc_shutdown(kecho_svc);
-        if (rc)
-            break;
-
-        kecho_svc = NULL;
-        break;
-
-    default:
-        rc = EOPNOTSUPP;
-        break;
+    rc = xx_svc_create(&svc);
+    if (rc) {
+        eprint("xx_svc_create() failed: %d\n", rc);
+        return rc;
     }
 
-    return rc;
+#if 1
+    rc = xx_svc_listen(svc, SOCK_DGRAM, host, port,
+                       NULL, kecho_recv_udp, kecho_destroy_cb,
+                       sizeof(struct conn_priv));
+    if (rc)
+        eprint("xx_svc_listen() failed: udp, rc %d\n", rc);
+#endif
+
+    rc = xx_svc_listen(svc, SOCK_STREAM, host, port,
+                       NULL, kecho_recv_tcp, kecho_destroy_cb,
+                       sizeof(struct conn_priv));
+    if (rc)
+        eprint("xx_svc_listen() failed: tcp, rc %d\n", rc);
+
+    kecho_svc = svc;
+
+    return 0;
 }
 
-moduledata_t xx_mod = {
-    "kecho",
-    xx_modevent,
-    NULL,
-};
+int
+kecho_mod_unload(module_t mod, int cmd, void *data)
+{
+    int rc;
 
-DECLARE_MODULE(kecho, xx_mod, SI_SUB_EXEC, SI_ORDER_ANY);
-MODULE_VERSION(kecho, 1);
+    rc = xx_svc_shutdown(kecho_svc);
+    if (rc)
+        return rc;
+
+    kecho_svc = NULL;
+
+    return 0;
+}

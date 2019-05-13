@@ -29,35 +29,28 @@
 #include <sys/kernel.h>
 #include <sys/kthread.h>
 #include <sys/lock.h>
-#include <sys/malloc.h>
 #include <sys/mutex.h>
-#include <sys/sx.h>
-#include <sys/rmlock.h>
-#include <sys/rwlock.h>
 #include <sys/proc.h>
 #include <sys/condvar.h>
 #include <sys/sched.h>
-#include <vm/uma.h>
 #include <sys/unistd.h>
-#include <machine/stdarg.h>
 #include <sys/sysctl.h>
-#include <sys/smp.h>
 #include <sys/cpuset.h>
-#include <sys/sbuf.h>
-#include <sys/mman.h>
-#include <sys/module.h>
-#include <netinet/in.h>
 #include <sys/uio.h>
+#include <vm/uma.h>
 
 #include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 
 #include "xx.h"
 #include "tdp.h"
 #include "svc.h"
 #include "ksf.h"
+
+MODULE_VERSION(krpc2, 1);
 
 MALLOC_DEFINE(M_XX_KRPC2, "krpc2", "krpc2 service");
 
@@ -70,26 +63,144 @@ SYSCTL_UINT(_debug_krpc2, OID_AUTO, debug,
             &xx_debug, 0,
             "Show debug tracing on console");
 
+struct conn_priv {
+    struct mbuf    *frag;
+    struct mbuf    *last;
+    struct mbuf    *msg;
+    struct mbuf    *hdr;
+    u_long  nrcvlowat;
+    int     rcvlowat;
+
+    struct mtx          txq_mtx;
+    STAILQ_HEAD(, xx_tdp_work) txq_head;
+    bool                txq_inited;
+    bool                txq_running;
+};
+
 static void
-krpc_recv(struct xx_conn *conn)
+krpc_send(struct xx_tdp_work *work)
+{
+    struct conn_priv *priv;
+    struct xx_conn *conn;
+    int sndpercall = 3;
+    struct mbuf *h;
+    int rc;
+
+  again:
+    conn = work->argv[0];
+    h = work->argv[1];
+    m_fixhdr(h);
+
+    rpc_rm_set(mtod(h, void *), h->m_pkthdr.len, true);
+    h->m_len += RPC_RM_SZ;
+
+    rc = sosend(conn->so, NULL, NULL, h, NULL, 0, curthread);
+    if (rc) {
+        eprint("sosend; conn %p, rc %d, %lu %lu\n",
+               conn, rc, conn->nsoupcalls, conn->ncallbacks);
+    }
+
+    priv = xx_conn_priv(conn);
+
+    mtx_lock(&priv->txq_mtx);
+    work = STAILQ_FIRST(&priv->txq_head);
+    if (work)
+        STAILQ_REMOVE_HEAD(&priv->txq_head, wqe);
+    priv->txq_running = !!work;
+    mtx_unlock(&priv->txq_mtx);
+
+    xx_conn_rele(conn);
+
+    if (work) {
+        if (--sndpercall > 0)
+            goto again;
+
+        work->func = krpc_send;
+        xx_tdp_enqueue(work, curcpu);
+    }
+}
+
+static void
+krpc_recv_rpc(struct xx_tdp_work *work)
+{
+    struct xx_conn *conn = work->argv[0];
+    struct conn_priv *priv = xx_conn_priv(conn);
+
+    mtx_lock(&priv->txq_mtx);
+    if (priv->txq_running) {
+        STAILQ_INSERT_TAIL(&priv->txq_head, work, wqe);
+        work = NULL;
+    }
+    priv->txq_running = true;
+    mtx_unlock(&priv->txq_mtx);
+
+    if (work) {
+        work->func = krpc_send;
+        xx_tdp_enqueue(work, curcpu);
+    }
+}
+
+/* The tcp accept callback is called once when a new connection
+ * is accepted, prior to receive upcall activation.  This is
+ * where we initialize the connection private data.
+ */
+static void
+krpc_accept_cb(struct xx_conn *conn)
+{
+    struct conn_priv *priv = xx_conn_priv(conn);
+
+    mtx_init(&priv->txq_mtx, "rpcmtx", NULL, MTX_DEF);
+    STAILQ_INIT(&priv->txq_head);
+    priv->txq_inited = true;
+}
+
+/* The tcp destroy callback is called once all the references
+ * to conn have been release, prior to socket close.  This
+ * is where we teardown the connection private data.
+ */
+static void
+krpc_destroy_cb(struct xx_conn *conn)
+{
+    struct conn_priv *priv = xx_conn_priv(conn);
+
+    KASSERT(priv->inited, "priv not initialized");
+
+    m_freem(priv->frag);
+    m_freem(priv->msg);
+    m_freem(priv->hdr);
+
+    mtx_destroy(&priv->txq_mtx);
+}
+
+/* The tcp receive callback is called whenever the socket has changed
+ * status or has data ready to read.
+ */
+static void
+krpc_recv_tcp(struct xx_conn *conn)
 {
     struct socket *so = conn->so;
-    struct mbuf *m = NULL;
+    struct conn_priv *priv;
+    u_int fraglen, reclen;
+    int rcvpercall = 3;
+    struct mbuf *m;
     struct uio uio;
-    u_int len;
+    bool reclast;
+    uint32_t rm;
     int flags;
     int rc;
 
+  again:
+    uio.uio_resid = IP_MAXPACKET;
     uio.uio_td = curthread;
-    uio.uio_resid = 1024 * 16;
     flags = MSG_DONTWAIT;
+    m = NULL;
 
     rc = soreceive(so, NULL, &uio, &m, NULL, &flags);
 
     if (rc || !m) {
-        dprint("conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-               conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
         if (rc != EWOULDBLOCK) {
+            eprint("soreceive: conn %p, rc %d, m %p, flags %x, %lu %lu\n",
+                   conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
             conn->active = false;
             xx_conn_rele(conn);
         }
@@ -97,77 +208,131 @@ krpc_recv(struct xx_conn *conn)
         return;
     }
 
-    if (conn->mrx) {
-        m_cat(conn->mrx, m);
+    priv = xx_conn_priv(conn);
+
+    /* Accumulate bytes until we have a full RPC record.
+     */
+    if (priv->last) {
+        m_cat(priv->last, m);
     } else {
-        conn->mrx = m;
+        priv->frag = m;
     }
 
-    len = m_length(conn->mrx, NULL);
-    if (len < RM_SZ)
+  more:
+    fraglen = m_length(priv->frag, &priv->last);
+    if (fraglen < RPC_RM_SZ)
         return;
 
-    m = conn->mrx;
-    conn->mrx = NULL;
+    /* The record mark tells us the length of the record and if it's
+     * the last record in the RPC message.
+     */
+    m_copydata(priv->frag, 0, RPC_RM_SZ, (caddr_t)&rm);
+    rpc_rm_get(&rm, &reclen, &reclast);
 
-    rc = sosend(so, NULL, NULL, m, NULL, 0, curthread);
-    if (rc) {
-        eprint("sosend: conn %p, resid %zu, rc %d\n",
-               conn, uio.uio_resid, rc);
-        conn->active = false;
-        xx_conn_rele(conn);
+    if (fraglen < reclen + RPC_RM_SZ) {
+        priv->rcvlowat = reclen + RPC_RM_SZ - fraglen;
+        if (priv->rcvlowat > 4096)
+            priv->rcvlowat = 4096;
+        xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
+        return;
     }
+
+    m = priv->frag;
+    m_adj(m, RPC_RM_SZ);
+
+    /* We now have at least one full RPC message, so split it
+     * from the ensuing data.
+     */
+    priv->frag = m_split(m, reclen, M_WAITOK);
+    if (!priv->frag)
+        priv->last = NULL;
+
+    /* Accumulate RPC records until we see the last record.
+     */
+    if (priv->msg) {
+        m_cat(priv->msg, m);
+    } else {
+        priv->msg = m;
+    }
+
+    if (reclast) {
+        struct xx_tdp_work *work;
+        struct mbuf *h;
+
+        h = priv->hdr;
+        if (!h)
+            h = m_gethdr(M_WAITOK, MT_DATA);
+
+        h->m_next = priv->msg;
+        priv->msg = NULL;
+
+        xx_conn_hold(conn);
+
+        work = mtod(h, struct xx_tdp_work *);
+        work->tdp = conn->work.tdp;
+        work->argv[0] = conn;
+        work->argv[1] = h;
+        work->func = krpc_recv_rpc;
+
+        xx_tdp_enqueue(work, curcpu);
+
+        priv->hdr = m_gethdr(M_NOWAIT, MT_DATA);
+    }
+
+    if (priv->frag)
+        goto more;
+
+    if (priv->rcvlowat != RPC_RM_SZ) {
+        priv->rcvlowat = RPC_RM_SZ;
+        xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
+        ++priv->nrcvlowat;
+    }
+
+    if (--rcvpercall > 0)
+        goto again;
 }
 
-static struct xx_svc *krpc_svc;
+static struct xx_svc *krpc2_svc;
 
-static int
-xx_modevent(module_t mod, int cmd, void *data)
+int
+krpc2_mod_load(module_t mod, int cmd, void *data)
 {
     const char *host = "0.0.0.0";
     in_port_t port = 60111;
     struct xx_svc *svc;
     int rc;
 
-    switch (cmd) {
-    case MOD_LOAD:
-        rc = xx_svc_create(&svc);
-        if (rc) {
-            eprint("xx_svc_create() failed: %d\n", rc);
-            break;
-        }
-
-        rc = xx_svc_listen(svc, SOCK_STREAM, host, port, krpc_recv);
-        if (rc) {
-            eprint("xx_lsn_create() failed: %d\n", rc);
-            xx_svc_shutdown(svc);
-            break;
-        }
-
-        krpc_svc = svc;
-        break;
-
-    case MOD_UNLOAD:
-        rc = xx_svc_shutdown(krpc_svc);
-        if (rc)
-            break;
-
-        krpc_svc = NULL;
-        break;
-
-    default:
-        rc = EOPNOTSUPP;
-        break;
+    rc = xx_svc_create(&svc);
+    if (rc) {
+        eprint("xx_svc_create() failed: %d\n", rc);
+        return rc;
     }
+
+    rc = xx_svc_listen(svc, SOCK_STREAM, host, port,
+                       krpc_accept_cb, krpc_recv_tcp, krpc_destroy_cb,
+                       sizeof(struct conn_priv));
+    if (rc) {
+        eprint("xx_svc_listen() failed: %d\n", rc);
+        xx_svc_shutdown(svc);
+        return rc;
+    }
+
+    krpc2_svc = svc;
+
+    return 0;
+}
+
+int
+krpc2_mod_unload(module_t mod, int cmd, void *data)
+{
+    int rc;
+
+    rc = xx_svc_shutdown(krpc2_svc);
+
+    dprint("%s: rc %d\n", __func__, rc);
+
+    if (!rc)
+        krpc2_svc = NULL;
 
     return rc;
 }
-
-moduledata_t xx_mod = {
-    "krpc2",
-    xx_modevent,
-    NULL,
-};
-
-DECLARE_MODULE(krpc2, xx_mod, SI_SUB_EXEC, SI_ORDER_ANY);
-MODULE_VERSION(krpc2, 1);

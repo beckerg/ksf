@@ -80,9 +80,10 @@ in_port_t port = 60111;
 long duration = 600;
 u_long msgcnt = 300000;
 size_t msglag = 128;
-size_t msglen = RM_SZ + 8;
+size_t msglen = RPC_RM_SZ + 8;
 char *host;
 bool async;
+bool udp;
 
 struct tdargs {
     struct sockaddr_in faddr;
@@ -114,6 +115,7 @@ static clp_option_t optionv[] = {
     CLP_OPTION(size_t, 'L', msglag, NULL, NULL, "async recv message max lag"),
     CLP_OPTION(size_t, 'l', msglen, NULL, NULL, "message length"),
     CLP_OPTION(uint16_t, 'p', port, NULL, NULL, "remote port"),
+    CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
 
     CLP_OPTION_END
 };
@@ -145,8 +147,8 @@ asrtest(int fd, struct tdargs *tdargs)
         txfragmax = txlen;
     txfrag = txfragmax;
 
-    *(uint32_t *)txbuf = htonl((msglen - RM_SZ) | 0x80000000u);
-    *(uint64_t *)(txbuf + RM_SZ) = htonll(msgtx);
+    rpc_rm_set(txbuf, (msglen - RPC_RM_SZ), true);
+    *(uint64_t *)(txbuf + RPC_RM_SZ) = htonll(msgtx);
 
     while (msgrx < msgcnt) {
         if (msgtx < msgcnt && msgtx - msgrx < msglag) {
@@ -166,7 +168,7 @@ asrtest(int fd, struct tdargs *tdargs)
                     txlen = msglen;
                     ++msgtx;
 
-                    *(uint64_t *)(txbuf + RM_SZ) = htonll(msgtx);
+                    *(uint64_t *)(txbuf + RPC_RM_SZ) = htonll(msgtx);
                 }
 
                 txfrag -= cc;
@@ -194,29 +196,28 @@ asrtest(int fd, struct tdargs *tdargs)
 
         rxlen -= cc;
         if (rxlen == 0) {
-            uint32_t rm = ntohl( *(uint32_t *)rxbuf );
-            u_long msgid = ntohll( *(uint64_t *)(rxbuf + RM_SZ) );
-            size_t rmlen;
-            bool rmlast;
+            u_long msgid = ntohll( *(uint64_t *)(rxbuf + RPC_RM_SZ) );
+            uint32_t rmlen;
+            bool last;
 
             rxlen = msglen;
             ++msgrx;
 
-            rmlast = RM_ISLAST(rm);
-            if (!rmlast) {
-                eprint("invalid record mark frag, expected %u, got %u, msgrx %lu\n",
-                       rm | 0x80000000u, rm, msgrx);
+            rpc_rm_get(rxbuf, &rmlen, &last);
+
+            if (!last) {
+                eprint("invalid record mark frag, rmlen %u, msgrx %lu\n",
+                       rmlen, msgrx);
                 break;
             }
 
-            rmlen = RM_LEN(rm);
-            if (rmlen != msglen - RM_SZ) {
-                eprint("invalid record mark length, expected %zu, got %zu, msgrx %lu\n",
-                       (msglen - RM_SZ), rmlen, msgrx);
+            if (rmlen != msglen - RPC_RM_SZ) {
+                eprint("invalid record mark length, expected %zu, got %u, msgrx %lu\n",
+                       (msglen - RPC_RM_SZ), rmlen, msgrx);
                 break;
             }
 
-            if (msgid != msgrx - 1) {
+            if (msgid != msgrx - 1 && msglag < 2) {
                 eprint("invalid msgrx, expected %lu, got %lu, rxlen %zu, cc %ld\n",
                        msgrx - 1, msgid, rxlen, cc);
                 break;
@@ -245,7 +246,11 @@ srtest(int fd, struct tdargs *tdargs)
     msgrx = 0;
     rc = 0;
 
-    while (msgrx++ < msgcnt) {
+    rpc_rm_set(txbuf, (msglen - RPC_RM_SZ), true);
+
+    while (msgrx < msgcnt) {
+        *(uint64_t *)(txbuf + RPC_RM_SZ) = htonll(msgrx);
+
         cc = send(fd, txbuf, msglen, 0);
 
         if (cc != msglen) {
@@ -260,7 +265,7 @@ srtest(int fd, struct tdargs *tdargs)
             break;
         }
 
-        cc = recv(fd, rxbuf, msglen, 0);
+        cc = recv(fd, rxbuf, msglen, MSG_WAITALL);
 
         if (cc != msglen) {
             if (cc == -1) {
@@ -273,6 +278,8 @@ srtest(int fd, struct tdargs *tdargs)
             rc = EIO;
             break;
         }
+
+        ++msgrx;
     }
 
     tdargs->iters = msgrx;
@@ -291,7 +298,7 @@ run(void *arg)
     int optval;
     int fd, rc;
 
-    fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    fd = socket(PF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
     if (fd == -1) {
         strerror_r(errno, errbuf, sizeof(errbuf));
         eprint("socket: %s\n", errbuf);
@@ -477,8 +484,8 @@ main(int argc, char **argv)
         msglag = 1;
     if (msgcnt < 1)
         msgcnt = 1;
-    if (msglen < RM_SZ + 8)
-        msglen = RM_SZ + 8;
+    if (msglen < RPC_RM_SZ + 8)
+        msglen = RPC_RM_SZ + 8;
 
     rxbufsz = roundup(msglen, 4096) * 2 * jobs;
     rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);

@@ -58,10 +58,7 @@
 
 MALLOC_DEFINE(M_XX_TDP, "xx_tdp", "xx thread pool");
 
-#define XX_TDP_WORKQ_MAX        (32)
-#define XX_TDP_TDPCPU_MAX       (2)  // Max threads per vCPU
-#define XX_TDP_CPUPWORKQ        (2)  // Max vCPUs per work queue
-#define XX_TDP_CPU2WORKQ(_cpu)  (((_cpu) / XX_TDP_CPUPWORKQ) % XX_TDP_WORKQ_MAX)
+#define XX_TDP_WORKQ_MAX        (16)
 
 struct xx_tdargs {
     void      (*func)(void *arg);
@@ -73,14 +70,15 @@ struct xx_tdargs {
 
 struct xx_tdp_workq {
     struct mtx                  mtx;
-    TAILQ_HEAD(, xx_tdp_work)   head;
+    STAILQ_HEAD(, xx_tdp_work)  head;
     bool                        running;
     bool                        growing;
     u_int                       tdsleeping;
     u_int                       tdcnt;
-
     u_int                       tdmax;
     u_int                       tdmin;
+    u_int                       spare;
+
     u_long                      callbacks;
     u_long                      grows;
     struct cv                   cv;
@@ -96,9 +94,13 @@ struct xx_tdp {
 
 static cpuset_t xx_tdp_cpuset;
 
-/* Create and start a kernel thread.  We acquire a reference on xx_inst
- * to prevent the kmod from being unloaded until all kthreads created
- * by this function have exited.
+static __always_inline struct xx_tdp_workq *
+xx_tdp_cpu2workq(struct xx_tdp *tdp, int cpu)
+{
+    return tdp->workqv + ((cpu / 2) % XX_TDP_WORKQ_MAX);
+}
+
+/* Create and start a kernel thread.
  */
 static int
 xx_tdp_kthread_create(struct xx_tdargs *tdargs)
@@ -127,7 +129,6 @@ xx_tdp_kthread_create(struct xx_tdargs *tdargs)
     return 0;
 }
 
-
 static int
 xx_tdp_hold(struct xx_tdp *tdp)
 {
@@ -148,12 +149,16 @@ xx_tdp_rele(struct xx_tdp *tdp)
     if (atomic_fetchadd_int(&tdp->refcnt, -1) > 1)
         return;
 
+    /* Give kthreads a brief opportunity to finish exiting.
+     * Is there a way to to this synchronously???
+     */
+    tsleep(tdp, 0, "tdpwait", 1);
+
     for (i = 0; i < XX_TDP_WORKQ_MAX + 1; ++i) {
         mtx_destroy(&tdp->workqv[i].mtx);
         cv_destroy(&tdp->workqv[i].cv);
     }
 
-    dprint("%s %p\n", __func__, tdp);
     tdp->magic = NULL;
     free(tdp, M_XX_TDP);
 }
@@ -161,7 +166,7 @@ xx_tdp_rele(struct xx_tdp *tdp)
 static void
 xx_tdp_grow(struct xx_tdp_work *work)
 {
-    struct xx_tdp_workq *workq = work->arg;
+    struct xx_tdp_workq *workq = work->argv[0];
     int rc;
 
     KASSERT(work && !work->tdp || !work->func, "invalid work");
@@ -182,14 +187,14 @@ xx_tdp_enqueue(struct xx_tdp_work *work, int cpu)
     KASSERT(work && !work->tdp || !work->func, "invalid work");
 
     tdp = work->tdp;
-    workq = tdp->workqv + XX_TDP_CPU2WORKQ(cpu);
+    workq = xx_tdp_cpu2workq(tdp, cpu);
 
     /* Append work to the target queue.  If we need to increase
      * the thread count of the target queue then append grow work
      * to the maintenance queue.
      */
     mtx_lock(&workq->mtx);
-    TAILQ_INSERT_TAIL(&workq->head, work, wqe);
+    STAILQ_INSERT_TAIL(&workq->head, work, wqe);
     work = NULL;
 
     if (workq->tdsleeping > 0) {
@@ -208,7 +213,7 @@ xx_tdp_enqueue(struct xx_tdp_work *work, int cpu)
         xx_tdp_hold(tdp);
 
         mtx_lock(&workq->mtx);
-        TAILQ_INSERT_TAIL(&workq->head, work, wqe);
+        STAILQ_INSERT_TAIL(&workq->head, work, wqe);
         if (workq->tdsleeping > 0)
             cv_signal(&workq->cv);
         mtx_unlock(&workq->mtx);
@@ -227,8 +232,8 @@ xx_tdp_shutdown(struct xx_tdp *tdp)
         struct xx_tdp_workq *workq = tdp->workqv + i;
 
         if (workq->callbacks > 0)
-            dprint("workq %2d, callbacks %lu, grows %lu\n",
-                   i, workq->callbacks, workq->grows);
+            dprint("workq %2d, grows %3lu, callbacks %8lu\n",
+                   i, workq->grows, workq->callbacks);
 
         mtx_lock(&workq->mtx);
         workq->running = false;
@@ -242,13 +247,10 @@ xx_tdp_shutdown(struct xx_tdp *tdp)
         struct xx_tdp_workq *workq = tdp->workqv + i;
 
         mtx_lock(&workq->mtx);
-        cv_broadcast(&workq->cv);
         while (workq->tdcnt > 0)
             cv_timedwait(&workq->cv, &workq->mtx, hz);
         mtx_unlock(&workq->mtx);
     }
-
-    dprint("%s %p\n", __func__, tdp);
 }
 
 static void
@@ -268,18 +270,18 @@ xx_tdp_run(void *arg)
     while (1) {
         struct xx_tdp_work *work;
 
-        work = TAILQ_FIRST(&workq->head);
+        work = STAILQ_FIRST(&workq->head);
         if (!work) {
             if ((timedout && workq->tdcnt > workq->tdmin) || !workq->running)
                 break;
 
             ++workq->tdsleeping;
-            timedout = cv_timedwait(&workq->cv, &workq->mtx, hz * 10);
+            timedout = cv_timedwait(&workq->cv, &workq->mtx, hz * 30);
             --workq->tdsleeping;
             continue;
         }
 
-        TAILQ_REMOVE(&workq->head, work, wqe);
+        STAILQ_REMOVE_HEAD(&workq->head, wqe);
         ++workq->callbacks;
         mtx_unlock(&workq->mtx);
 
@@ -288,7 +290,8 @@ xx_tdp_run(void *arg)
         mtx_lock(&workq->mtx);
     }
 
-    --workq->tdcnt;
+    if (--workq->tdcnt < 1)
+        cv_signal(&workq->cv);
     mtx_unlock(&workq->mtx);
 
     xx_tdp_rele(tdp);
@@ -305,7 +308,7 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
     struct cpuset *set;
     struct thread *td;
     struct proc *proc;
-    int i, rc;
+    int i, rc, width;
 
     if (tdmin > 1024 || tdmax > 1024)
         return NULL;
@@ -333,7 +336,7 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
 
         mtx_init(&workq->mtx, "wqmtx", NULL, MTX_DEF);
         cv_init(&workq->cv, "wqcv");
-        TAILQ_INIT(&workq->head);
+        STAILQ_INIT(&workq->head);
         workq->running = true;
         workq->tdmin = tdmin;
         workq->tdmax = tdmax;
@@ -348,7 +351,7 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
 
         workq->grow.tdp = tdp;
         workq->grow.func = xx_tdp_grow;
-        workq->grow.arg = workq;
+        workq->grow.argv[0] = workq;
     }
 
     /* For each vCPU, find the work queue to which it hashes
@@ -356,20 +359,37 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
      */
     for (i = 0; i < CPU_COUNT(&xx_tdp_cpuset); ++i) {
         if (CPU_ISSET(i, &xx_tdp_cpuset)) {
-            workq = tdp->workqv + XX_TDP_CPU2WORKQ(i);
+            workq = xx_tdp_cpu2workq(tdp, i);
             tdargs = &workq->tdargs;
 
             CPU_SET(i, &tdargs->cpuset);
         }
     }
 
+    width = 0;
     for (i = 0; i < XX_TDP_WORKQ_MAX; ++i) {
+        char buf[CPUSETBUFSIZ];
+
         workq = tdp->workqv + i;
         tdargs = &workq->tdargs;
 
         if (CPU_EMPTY(&tdargs->cpuset))
             CPU_COPY(&xx_tdp_cpuset, &tdargs->cpuset);
+
+        cpusetobj_strprint(buf, &tdargs->cpuset);
+        if (strlen(buf) > width)
+            width = strlen(buf);
     }
+
+    for (i = 0; i < XX_TDP_WORKQ_MAX; ++i) {
+        char buf[CPUSETBUFSIZ];
+
+        workq = tdp->workqv + i;
+        tdargs = &workq->tdargs;
+
+        dprint("workq %2d  %*s\n", i, width, cpusetobj_strprint(buf, &tdargs->cpuset));
+    }
+
 
     /* Start the maintenance kthread.
      */

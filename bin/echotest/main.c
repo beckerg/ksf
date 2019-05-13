@@ -81,6 +81,7 @@ size_t msglag = 128;
 size_t msglen = 1;
 char *host;
 bool async;
+bool udp;
 
 struct tdargs {
     struct sockaddr_in faddr;
@@ -112,6 +113,7 @@ static clp_option_t optionv[] = {
     CLP_OPTION(size_t, 'L', msglag, NULL, NULL, "async recv message max lag"),
     CLP_OPTION(size_t, 'l', msglen, NULL, NULL, "message length"),
     CLP_OPTION(uint16_t, 'p', port, NULL, NULL, "remote port"),
+    CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
 
     CLP_OPTION_END
 };
@@ -221,12 +223,12 @@ srtest(int fd, struct tdargs *tdargs)
                 break;
             }
 
-            eprint("send: cc %ld: short write\n", cc);
+            eprint("sendto: cc %ld: short write\n", cc);
             rc = EIO;
             break;
         }
 
-        cc = recv(fd, rxbuf, msglen, 0);
+        cc = recv(fd, rxbuf, msglen, MSG_WAITALL);
 
         if (cc != msglen) {
             if (cc == -1) {
@@ -235,7 +237,7 @@ srtest(int fd, struct tdargs *tdargs)
                 break;
             }
 
-            eprint("recv: cc %ld short read\n", cc);
+            eprint("recvfrom: cc %ld short read\n", cc);
             rc = EIO;
             break;
         }
@@ -253,11 +255,12 @@ run(void *arg)
     struct timeval ru_utime, ru_stime, ru_total;
     struct rusage ru_start, ru_stop;
     struct tdargs *tdargs = arg;
+    double bytespersec;
     long usecs;
     int optval;
     int fd, rc;
 
-    fd = socket(PF_INET, SOCK_STREAM, IPPROTO_TCP);
+    fd = socket(PF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
     if (fd == -1) {
         strerror_r(errno, errbuf, sizeof(errbuf));
         eprint("socket: %s\n", errbuf);
@@ -299,6 +302,7 @@ run(void *arg)
 
     timersub(&tv_stop, &tv_start, &tv_diff);
     usecs = tv_diff.tv_sec * 1000000 + tv_diff.tv_usec;
+    bytespersec = (msglen * tdargs->iters * 1000000) / usecs;
     tdargs->usecs = usecs;
 
     timersub(&ru_stop.ru_utime, &ru_start.ru_utime, &ru_utime);
@@ -306,11 +310,12 @@ run(void *arg)
     timeradd(&ru_utime, &ru_stime, &ru_total);
     tdargs->cpu = ru_total.tv_sec * 1000000 + ru_total.tv_usec;
 
-    dprint(1, "%p, fd %2d, usecs %ld, cpu %ld %.2lf, msgs/sec %ld, bytes/sec %ld, %ld %ld\n",
+    dprint(1, "%p, fd %2d, usecs %ld, cpu %ld %.2lf, msgs/sec %ld, MBps %.2lf, Gbps %.2lf, %ld %ld\n",
            tdargs->td, fd, usecs,
            tdargs->cpu, (double)tdargs->cpu / tdargs->iters,
            (tdargs->iters * 1000000) / usecs,
-           (msglen * tdargs->iters * 1000000) / usecs,
+           bytespersec / (1ul << 20),
+           (bytespersec * 8) / 1000000000,
            tdargs->tx_eagain, tdargs->rx_eagain);
 
     close(fd);
@@ -334,6 +339,7 @@ main(int argc, char **argv)
     struct tdargs *tdargv;
     struct hostent *hent;
     char *server, *user;
+    double bytespersec;
     size_t rxbufsz;
     char *rxbuf;
     long *prxbuf;
@@ -506,12 +512,14 @@ main(int argc, char **argv)
     }
 
     usecs /= jobs;
+    bytespersec = (msglen * iters * 1000000.0) / usecs;
 
-    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %ld, bytes/sec %ld, cpu/msg %.2lf\n",
+    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %ld, MBps %.2lf, Gbps %.2lf, cpu/msg %.2lf\n",
            iters, usecs, cpu,
            (iters * 1000000) / usecs,
            usecs * jobs / iters,
-           (msglen * iters * 1000000) / usecs,
+           bytespersec / (1ul << 20),
+           (bytespersec * 8) / 1000000000,
            (double)cpu / iters);
 
     munmap(rxbuf, rxbufsz);

@@ -44,6 +44,7 @@
 #include <sys/socket.h>
 #include <sys/socketvar.h>
 #include <netinet/in.h>
+#include <netinet/ip.h>
 
 #include "xx.h"
 #include "tdp.h"
@@ -65,8 +66,15 @@ struct xx_svc {
     void                   *magic;
 };
 
+struct xx_lsn_priv {
+    xx_conn_cb_t   *accept_cb;
+    xx_conn_cb_t   *recv_cb;
+    xx_conn_cb_t   *destroy_cb;
+    size_t          privsz;
+};
+
 static int xx_svc_hold(struct xx_svc *svc);
-static void xx_svc_rele(struct xx_svc *svc);
+static int xx_svc_rele(struct xx_svc *svc);
 
 int
 xx_conn_hold(struct xx_conn *conn)
@@ -89,37 +97,47 @@ xx_conn_rele(struct xx_conn *conn)
 
     mtx_lock(&svc->mtx);
     TAILQ_REMOVE(&svc->connq, conn, connq_entry);
-    cv_broadcast(&svc->cv);
     conn->active = false;
     mtx_unlock(&svc->mtx);
 
+    if (conn->destroy_cb)
+        conn->destroy_cb(conn);
+
     soclose(conn->so);
     free(conn->laddr, M_SONAME);
-    m_freem(conn->mrx);
 
     conn->magic = NULL;
     free(conn, M_XX_CONN);
 
-    xx_svc_rele(svc);
+    mtx_lock(&svc->mtx);
+    if (xx_svc_rele(svc) == 1)
+        cv_broadcast(&svc->cv);
+    mtx_unlock(&svc->mtx);
 }
 
 static struct xx_conn *
 xx_conn_create(struct xx_svc *svc, struct socket *so,
-               xx_tdp_work_cb_t *workcb, xx_conn_cb_t *recv)
+               xx_tdp_work_cb_t *workcb, xx_conn_cb_t *recv_cb,
+               xx_conn_cb_t *destroy_cb, size_t privsz)
 {
     struct xx_conn *conn;
+    size_t sz;
 
-    conn = malloc(sizeof(*conn), M_XX_CONN, M_ZERO | M_WAITOK);
+    sz = sizeof(*conn) + privsz;
+
+    conn = malloc(sz, M_XX_CONN, M_ZERO | M_WAITOK);
     if (conn) {
         conn->so = so;
         conn->svc = svc;
         conn->refcnt = 1;
         conn->active = true;
-        conn->recv = recv;
+        conn->recv_cb = recv_cb;
+        conn->destroy_cb = destroy_cb;
+        conn->privsz = privsz;
         conn->magic = conn;
         conn->work.tdp = svc->tdp;
         conn->work.func = workcb;
-        conn->work.arg = conn;
+        conn->work.argv[0] = conn;
 
         mtx_lock(&svc->mtx);
         TAILQ_INSERT_TAIL(&svc->connq, conn, connq_entry);
@@ -154,11 +172,11 @@ xx_rcv_soupcall(struct socket *so, void *arg, int wait)
 static void
 xx_rcv_receive(struct xx_tdp_work *work)
 {
-    struct xx_conn *conn = work->arg;
+    struct xx_conn *conn = work->argv[0];
 
     ++conn->ncallbacks;
 
-    conn->recv(conn);
+    conn->recv_cb(conn);
 
     /* Reschedule this callback if there is more data to be read,
      * otherwise re-arm the socket receive upcall.
@@ -205,13 +223,14 @@ xx_lsn_soupcall(struct socket *so, void *arg, int wait)
 }
 
 static void
-xx_svc_accept(struct xx_tdp_work *work)
+xx_svc_accept_tcp(struct xx_tdp_work *work)
 {
-    struct xx_conn *lsn = work->arg;
+    struct xx_conn *lsn = work->argv[0];
     struct xx_svc *svc = lsn->svc;
     struct sockaddr *laddr = NULL;
     struct xx_conn *conn = NULL;
     struct socket *so = NULL;
+    struct xx_lsn_priv *priv;
     struct socket *head;
     short nbio;
     int rc;
@@ -242,9 +261,15 @@ xx_svc_accept(struct xx_tdp_work *work)
         goto errout;
     }
 
-    conn = xx_conn_create(svc, so, xx_rcv_receive, lsn->recv);
+    priv = xx_conn_priv(lsn);
+
+    conn = xx_conn_create(svc, so, xx_rcv_receive,
+                          priv->recv_cb, priv->destroy_cb, priv->privsz);
     if (conn) {
         conn->laddr = laddr;
+
+        if (priv->accept_cb)
+            priv->accept_cb(conn);
 
         SOCKBUF_LOCK(&so->so_rcv);
         soupcall_set(so, SO_RCV, xx_rcv_soupcall, conn);
@@ -254,13 +279,10 @@ xx_svc_accept(struct xx_tdp_work *work)
     laddr = NULL;
     so = NULL;
 
-  errout:
-    dprint("lsn %p, active %d, conn %p, rc %d, %lu %lu\n",
-           lsn, lsn->active, conn, rc, lsn->nsoupcalls, lsn->ncallbacks);
-
     /* Reschedule this callback if there is more data to be read,
      * otherwise re-arm the socket listen upcall.
      */
+  errout:
     if (lsn->active) {
         bool rearm;
 
@@ -284,23 +306,50 @@ xx_svc_accept(struct xx_tdp_work *work)
     xx_conn_rele(lsn);
 }
 
+static void
+xx_svc_accept_udp(struct xx_tdp_work *work)
+{
+    struct xx_conn *lsn = work->argv[0];
+    struct xx_lsn_priv *priv, privbuf;
+
+    ++lsn->ncallbacks;
+
+    priv = xx_conn_priv(lsn);
+    privbuf = *priv;
+    memset(priv, 0, sizeof(*priv));
+
+    if (privbuf.accept_cb)
+        privbuf.accept_cb(lsn);
+
+    lsn->recv_cb = privbuf.recv_cb;
+    lsn->destroy_cb = privbuf.destroy_cb;
+    lsn->work.func = xx_rcv_receive;
+
+    xx_rcv_receive(work);
+}
+
 /* xx_lsn_create() creates a listening socket at the given address.
  * For each socket it successfully accepts it creates a connection
  * object and arranges for recv() to be called when the socket is
  * ready to read.
  */
 int
-xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port, xx_conn_cb_t *recv)
+xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port,
+              xx_conn_cb_t *accept_cb, xx_conn_cb_t *recv_cb,
+              xx_conn_cb_t *destroy_cb,
+              size_t privsz)
 {
+    struct xx_lsn_priv *priv;
+    xx_tdp_work_cb_t *workcb;
     struct sockaddr_in sin;
     struct xx_conn *conn;
-    struct sockopt sopt;
     struct thread *td;
     struct socket *so;
     struct timeval tv;
+    size_t privszmax;
     int val, rc;
 
-    if (!svc || !host || !recv)
+    if (!svc || !host || !recv_cb)
         return EINVAL;
 
     bzero(&sin, sizeof(sin));
@@ -323,14 +372,7 @@ xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port, xx
 
     tv.tv_sec = 1;
     tv.tv_usec = 0;
-    bzero(&sopt, sizeof(sopt));
-    sopt.sopt_dir = SOPT_SET;
-    sopt.sopt_level = SOL_SOCKET;
-    sopt.sopt_name = SO_RCVTIMEO;
-    sopt.sopt_val = &tv;
-    sopt.sopt_valsize = sizeof(tv);
-
-    rc = sosetopt(so, &sopt);
+    rc = xx_sosetopt(so, SO_RCVTIMEO, &tv, sizeof(tv));
     if (rc) {
         eprint("sosetopt(SO_RCVTIMEO): rc %d\n", rc);
         soclose(so);
@@ -338,14 +380,7 @@ xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port, xx
     }
 
     val = 1;
-    bzero(&sopt, sizeof(sopt));
-    sopt.sopt_dir = SOPT_SET;
-    sopt.sopt_level = SOL_SOCKET;
-    sopt.sopt_name = SO_REUSEADDR;
-    sopt.sopt_val = &val;
-    sopt.sopt_valsize = sizeof(val);
-
-    rc = sosetopt(so, &sopt);
+    rc = xx_sosetopt(so, SO_REUSEADDR, &val, sizeof(val));
     if (rc) {
         eprint("sosetopt(SO_REUSEADDR): rc %d\n", rc);
         soclose(so);
@@ -359,24 +394,46 @@ xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port, xx
         return rc;
     }
 
-    rc = solisten(so, -1, td);
-    if (rc) {
-        eprint("solisten(): rc %d\n", rc);
-        soclose(so);
-        return rc;
+    if (type == SOCK_STREAM || type == SOCK_SEQPACKET) {
+        workcb = xx_svc_accept_tcp;
+
+        rc = solisten(so, -1, td);
+        if (rc) {
+            eprint("solisten(): rc %d\n", rc);
+            soclose(so);
+            return rc;
+        }
+    }
+    else {
+        workcb = xx_svc_accept_udp;
     }
 
-    conn = xx_conn_create(svc, so, xx_svc_accept, recv);
+    privszmax = max(sizeof(*priv), privsz);
+
+    conn = xx_conn_create(svc, so, workcb, NULL, NULL, privszmax);
     if (!conn) {
         eprint("xx_conn_create(): rc %d\n", rc);
         soclose(so);
         return ENOMEM;
     }
 
-    SOLISTEN_LOCK(so);
-    solisten_upcall_set(so, xx_lsn_soupcall, conn);
-    so->so_state |= SS_NBIO;
-    solisten_wakeup(so);
+    priv = xx_conn_priv(conn);
+    priv->accept_cb = accept_cb;
+    priv->recv_cb = recv_cb;
+    priv->destroy_cb = destroy_cb;
+    priv->privsz = privsz;
+
+    if (type == SOCK_STREAM || type == SOCK_SEQPACKET) {
+        SOLISTEN_LOCK(so);
+        solisten_upcall_set(so, xx_lsn_soupcall, conn);
+        //so->so_state |= SS_NBIO;
+        solisten_wakeup(so);
+    }
+    else {
+        SOCKBUF_LOCK(&so->so_rcv);
+        soupcall_set(so, SO_RCV, xx_rcv_soupcall, conn);
+        sorwakeup_locked(so);
+    }
 
     return 0;
 }
@@ -390,14 +447,17 @@ xx_svc_hold(struct xx_svc *svc)
     return atomic_fetchadd_int(&svc->refcnt, 1) + 1;
 }
 
-static void
+static int
 xx_svc_rele(struct xx_svc *svc)
 {
+    int refcnt;
+
     KASSERT(svc->magic == svc, "invalid svc magic");
     KASSERT(svc->refcnt > 0, "invalid svc refcnt");
 
-    if (atomic_fetchadd_int(&svc->refcnt, -1) > 1)
-        return;
+    refcnt = atomic_fetchadd_int(&svc->refcnt, -1);
+    if (refcnt > 1)
+        return refcnt - 1;
 
     xx_tdp_shutdown(svc->tdp);
     xx_tdp_rele(svc->tdp);
@@ -405,9 +465,10 @@ xx_svc_rele(struct xx_svc *svc)
     mtx_destroy(&svc->mtx);
     cv_destroy(&svc->cv);
 
-    dprint("%s %p\n", __func__, svc);
     svc->magic = NULL;
     free(svc, M_XX_SVC);
+
+    return 0;
 }
 
 int
@@ -427,16 +488,16 @@ xx_svc_shutdown(struct xx_svc *svc)
             }
         }
 
-        rc = cv_timedwait_sig(&svc->cv, &svc->mtx, hz * 3);
+        rc = cv_wait_sig(&svc->cv, &svc->mtx);
         if (rc && rc != EWOULDBLOCK) {
             mtx_unlock(&svc->mtx);
             return EINTR;
         }
     }
-    mtx_unlock(&svc->mtx);
 
     while (atomic_load_int(&svc->refcnt) > 1)
-        tsleep(svc, 0, "svcshut", hz);
+        cv_wait(&svc->cv, &svc->mtx);
+    mtx_unlock(&svc->mtx);
 
     xx_svc_rele(svc);
 

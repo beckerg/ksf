@@ -26,12 +26,29 @@
 #ifndef KSF_H
 #define KSF_H
 
-/* Record mark for RPC message framing.
+/* Record marking for RPC message framing.
  */
-#define RM_SZ           (4)
-#define RM_ISLAST(_rm)  ((_rm) & 0x80000000u)
-#define RM_SETLAST(_rm) ((_rm) | 0x80000000u)
-#define RM_LEN(_rm)     ((_rm) & ~0x80000000u)
+#define RPC_RM_SZ               (4)
+
+static inline void
+rpc_rm_get(const void *ptr, uint32_t *msglenp, bool *lastp)
+{
+    uint32_t mark = ntohl( *(const uint32_t *)ptr );
+
+    *msglenp = mark & ~0x80000000u;
+    *lastp = mark & 0x80000000u;
+}
+
+static inline void
+rpc_rm_set(void *ptr, uint32_t msglen, bool last)
+{
+    uint32_t mark = msglen;
+
+    if (last)
+        mark |= 0x80000000u;
+
+    *(uint32_t *)ptr = htonl(mark);
+}
 
 #ifndef ntohll
 #define ntohll(_x)  be64toh(_x)

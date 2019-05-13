@@ -48,11 +48,18 @@
 #include <sys/module.h>
 #include <netinet/in.h>
 
+#include <sys/mbuf.h>
+#include <sys/socket.h>
+#include <sys/socketvar.h>
+#include <netinet/in.h>
+
 #include "xx.h"
 
-extern moduledata_t xx_mod;
+#define KSF_MODEVENT_FUNC(_module, _func, _mod, _cmd, _data)    \
+    CAT(_module, _func)((_mod), (_cmd), (_data))
 
-struct xx_inst *xx_inst;
+static moduledata_t xx_mod;
+
 u_int xx_debug = 1;
 
 void
@@ -70,3 +77,49 @@ xx_dprint(u_int lvl, const char *func, int line, const char *fmt, ...)
     else if (lvl > 0)
         printf("%s: %2d %s", xx_mod.name, curcpu, msg);
 }
+
+int
+xx_sosetopt(struct socket *so, int name, void *val, size_t valsz)
+{
+    struct sockopt sopt;
+
+    bzero(&sopt, sizeof(sopt));
+    sopt.sopt_dir = SOPT_SET;
+    sopt.sopt_level = SOL_SOCKET;
+    sopt.sopt_name = name;
+    sopt.sopt_val = val;
+    sopt.sopt_valsize = valsz;
+
+    return sosetopt(so, &sopt);
+}
+
+static int
+xx_modevent(module_t mod, int cmd, void *data)
+{
+    int rc;
+
+    switch (cmd) {
+    case MOD_LOAD:
+        rc = KSF_MODEVENT_FUNC(KSF_MOD, _mod_load, mod, cmd, data);
+        break;
+
+    case MOD_UNLOAD:
+        rc = KSF_MODEVENT_FUNC(KSF_MOD, _mod_unload, mod, cmd, data);
+        break;
+
+    default:
+        rc = EOPNOTSUPP;
+        break;
+    }
+
+    return rc;
+}
+
+static moduledata_t xx_mod = {
+    KSF_MOD_NAME,
+    xx_modevent,
+    NULL,
+};
+
+DECLARE_MODULE(KSF_MOD, xx_mod, SI_SUB_EXEC, SI_ORDER_ANY);
+//MODULE_VERSION(KSF_MOD, 1);
