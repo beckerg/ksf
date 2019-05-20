@@ -57,6 +57,7 @@
 #include <rpc/types.h>
 #include <rpc/auth.h>
 #include <rpc/rpc.h>
+#include <rpcsvc/nfs_prot.h>
 
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>
@@ -65,6 +66,8 @@
 #include "main.h"
 #include "clp.h"
 #include "ksf.h"
+
+#define NFS3_NULL   (0)
 
 char version[] = PROG_VERSION;
 char *progname;
@@ -76,11 +79,14 @@ FILE *eprint_fp;
 pthread_barrier_t bar_start;
 pthread_barrier_t bar_end;
 unsigned int jobs = 1;
-in_port_t port = 60111;
+in_port_t port = 62049;
 long duration = 600;
 u_long msgcnt = 300000;
-size_t msglag = 128;
-size_t msglen = RPC_RM_SZ + 8;
+size_t msgmax = 128 * 1024;
+size_t msglag = 31;
+enum_t auth_flavor;
+char *auth_type = "none";
+AUTH *auth;
 char *host;
 bool async;
 bool udp;
@@ -89,6 +95,7 @@ struct tdargs {
     struct sockaddr_in faddr;
     pthread_t td;
     char *rxbuf;
+    size_t bytes;
     long iters;
     long usecs;
     long cpu;
@@ -109,46 +116,112 @@ static clp_option_t optionv[] = {
     CLP_OPTION_VERSION(version),
     CLP_OPTION_HELP,
 
+    CLP_OPTION(string, 'A', auth_type, NULL, NULL, "auth type (none, sys, unix)"),
     CLP_OPTION(bool, 'a', async, NULL, NULL, "asynchronous send/recv mode"),
     CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of concurrent jobs (worker threads)"),
     CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "message count"),
     CLP_OPTION(size_t, 'L', msglag, NULL, NULL, "async recv message max lag"),
-    CLP_OPTION(size_t, 'l', msglen, NULL, NULL, "message length"),
-    CLP_OPTION(uint16_t, 'p', port, NULL, NULL, "remote port"),
     CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
 
     CLP_OPTION_END
 };
 
+int
+rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, void *buf, size_t bufsz)
+{
+    struct rpc_msg msg;
+    XDR xdr;
+    int len;
+
+    if (!buf || bufsz < sizeof(msg) + RPC_RM_SZ) {
+        eprint("einval: bufsz %zu\n", bufsz);
+        abort();
+    }
+
+    msg.rm_xid = xid;
+    msg.rm_direction = CALL;
+    msg.rm_call.cb_rpcvers = RPC_MSG_VERSION;
+    msg.rm_call.cb_prog = NFS_PROGRAM;
+    msg.rm_call.cb_vers = 3;
+    msg.rm_call.cb_proc = proc;
+
+    if (auth) {
+        msg.rm_call.cb_cred = auth->ah_cred;
+        msg.rm_call.cb_verf = auth->ah_verf;
+    } else {
+        msg.rm_call.cb_cred = _null_auth;
+        msg.rm_call.cb_verf = _null_auth;
+    }
+
+    /* Create the serialized RPC message, leaving room at the
+     * front for the RPC record mark.
+     */
+    xdrmem_create(&xdr, buf + RPC_RM_SZ, bufsz - RPC_RM_SZ, XDR_ENCODE);
+    len = -1;
+
+    if (xdr_callmsg(&xdr, &msg)) {
+        len = xdr_getpos(&xdr);
+        rpc_rm_set(buf, len, true);
+        len += RPC_RM_SZ;
+    }
+
+    xdr_destroy(&xdr);
+
+    return len;
+}
+
+enum clnt_stat
+rpc_decode(XDR *xdr, char *buf, int len,
+           struct rpc_msg *rpc_msg, struct rpc_err *rpc_err)
+{
+    xdrmem_create(xdr, buf, len, XDR_DECODE);
+
+    rpc_msg->acpted_rply.ar_verf = _null_auth;
+    rpc_msg->acpted_rply.ar_results.where = NULL;
+    rpc_msg->acpted_rply.ar_results.proc = (xdrproc_t)xdr_void;
+
+    if (xdr_replymsg(xdr, rpc_msg)) {
+        _seterr_reply(rpc_msg, rpc_err);
+    } else {
+        rpc_err->re_status = RPC_CANTDECODERES;
+    }
+
+    return rpc_err->re_status;
+}
 
 /* Asynchronous send/recv loop.  Note that the send can race ahead
  * of the receiver by at most msglag messages.
  */
 int
-asrtest(int fd, struct tdargs *tdargs)
+nullproc_async(int fd, struct tdargs *tdargs)
 {
     char *rxbuf, *txbuf, errbuf[128];
     ssize_t rxlen, txlen, txfrag, txfragmax, cc;
     int rxflags, txflags;
     u_long msgrx, msgtx;
+    uint32_t rmlen;
+    int rpclen;
     int rc;
 
     rxbuf = tdargs->rxbuf;
-    txbuf = rxbuf + roundup(msglen, 4096);
+    txbuf = rxbuf + roundup(msgmax, 4096);
     txflags = MSG_DONTWAIT;
     rxflags = MSG_DONTWAIT;
     msgrx = msgtx = 0;
-    rxlen = msglen;
-    txlen = msglen;
     rc = 0;
+
+    txlen = rpc_encode(msgtx, NFS3_NULL, auth, txbuf, msgmax);
+    if (txlen == -1) {
+        eprint("rpc_encode: txlen %ld, msgtx %ld\n", txlen, msgtx);
+        abort();
+    }
 
     txfragmax = 8192;
     if (txfragmax > txlen)
         txfragmax = txlen;
     txfrag = txfragmax;
 
-    rpc_rm_set(txbuf, (msglen - RPC_RM_SZ), true);
-    *(uint64_t *)(txbuf + RPC_RM_SZ) = htonll(msgtx);
+    rxlen = rmlen = 0;
 
     while (msgrx < msgcnt) {
         if (msgtx < msgcnt && msgtx - msgrx < msglag) {
@@ -163,12 +236,11 @@ asrtest(int fd, struct tdargs *tdargs)
                 ++tdargs->tx_eagain;
             }
             else {
+                tdargs->bytes += cc;
                 txlen -= cc;
                 if (txlen == 0) {
-                    txlen = msglen;
                     ++msgtx;
-
-                    *(uint64_t *)(txbuf + RPC_RM_SZ) = htonll(msgtx);
+                    txlen = rpc_encode(msgtx, NFS3_NULL, auth, txbuf, msgmax);
                 }
 
                 txfrag -= cc;
@@ -182,8 +254,34 @@ asrtest(int fd, struct tdargs *tdargs)
 
         rxflags = (msgtx - msgrx < msglag) ? MSG_DONTWAIT : 0;
 
-        cc = recv(fd, rxbuf + (msglen - rxlen), rxlen, rxflags);
-        if (cc == -1) {
+        /* Peek at the RPC record mark so that we can get the
+         * size of the record fragment.
+         */
+        if (rmlen == 0) {
+            bool last;
+
+            cc = recv(fd, rxbuf, RPC_RM_SZ, MSG_PEEK | rxflags);
+            if (cc < RPC_RM_SZ)
+                continue;
+
+            rpc_rm_get(rxbuf, &rmlen, &last);
+            if (!last) {
+                eprint("invalid record mark frag, rmlen %u, msgrx %lu\n",
+                       rmlen, msgrx);
+                break;
+            }
+
+            rpclen = rmlen + RPC_RM_SZ;
+            rxlen = rpclen;
+        }
+
+        cc = recv(fd, rxbuf + (rpclen - rxlen), rxlen, rxflags);
+        if (cc != rxlen) {
+            if (cc == 0) {
+                eprint("recv: eof\n");
+                break;
+            }
+
             if (errno != EAGAIN) {
                 strerror_r(rc = errno, errbuf, sizeof(errbuf));
                 eprint("recv: cc %ld %s\n", cc, errbuf);
@@ -196,64 +294,59 @@ asrtest(int fd, struct tdargs *tdargs)
 
         rxlen -= cc;
         if (rxlen == 0) {
-            u_long msgid = ntohll( *(uint64_t *)(rxbuf + RPC_RM_SZ) );
-            uint32_t rmlen;
-            bool last;
-
-            rxlen = msglen;
+            tdargs->bytes += rmlen;
+            rmlen = 0;
             ++msgrx;
-
-            rpc_rm_get(rxbuf, &rmlen, &last);
-
-            if (!last) {
-                eprint("invalid record mark frag, rmlen %u, msgrx %lu\n",
-                       rmlen, msgrx);
-                break;
-            }
-
-            if (rmlen != msglen - RPC_RM_SZ) {
-                eprint("invalid record mark length, expected %zu, got %u, msgrx %lu\n",
-                       (msglen - RPC_RM_SZ), rmlen, msgrx);
-                break;
-            }
-
-            if (msgid != msgrx - 1 && msglag < 2) {
-                eprint("invalid msgrx, expected %lu, got %lu, rxlen %zu, cc %ld\n",
-                       msgrx - 1, msgid, rxlen, cc);
-                break;
-            }
-
-            *(uint64_t *)rxbuf = 0;
         }
     }
 
     tdargs->iters = msgrx;
+
     return rc;
 }
 
 /* Synchronous send/recv loop...
  */
 int
-srtest(int fd, struct tdargs *tdargs)
+nullproc_sync(int fd, struct tdargs *tdargs)
 {
     char *rxbuf, *txbuf, errbuf[128];
     ssize_t cc;
     long msgrx;
+    int optval;
     int rc;
 
+    optval = RPC_RM_SZ;
+    rc = setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &optval, sizeof(optval));
+    if (rc) {
+        strerror_r(errno, errbuf, sizeof(errbuf));
+        eprint("setsockopt(SO_RCVLOWAT): %s\n", errbuf);
+        abort();
+    }
+
     rxbuf = tdargs->rxbuf;
-    txbuf = rxbuf + roundup(msglen, 4096);
+    txbuf = rxbuf + roundup(msgmax, 4096);
     msgrx = 0;
     rc = 0;
 
-    rpc_rm_set(txbuf, (msglen - RPC_RM_SZ), true);
-
     while (msgrx < msgcnt) {
-        *(uint64_t *)(txbuf + RPC_RM_SZ) = htonll(msgrx);
+        struct rpc_msg rmsg;
+        struct rpc_err rerr;
+        enum clnt_stat stat;
+        uint32_t rmlen;
+        int rpclen;
+        bool last;
+        XDR xdr;
 
-        cc = send(fd, txbuf, msglen, 0);
+        rpclen = rpc_encode(msgrx, NFS3_NULL, auth, txbuf, msgmax);
+        if (rpclen == -1) {
+            eprint("rpc_encode: len %d, msgrx %ld\n", rpclen, msgrx);
+            abort();
+        }
 
-        if (cc != msglen) {
+        cc = send(fd, txbuf, rpclen, 0);
+
+        if (cc != rpclen) {
             if (cc == -1) {
                 strerror_r(rc = errno, errbuf, sizeof(errbuf));
                 eprint("send: cc %ld: %s\n", cc, errbuf);
@@ -265,24 +358,63 @@ srtest(int fd, struct tdargs *tdargs)
             break;
         }
 
-        cc = recv(fd, rxbuf, msglen, MSG_WAITALL);
+        /* Peek at the RPC record mark so that we can get the
+         * size of the record fragment.
+         */
+        cc = recv(fd, rxbuf, RPC_RM_SZ, MSG_PEEK | MSG_WAITALL);
 
-        if (cc != msglen) {
+        if (cc < RPC_RM_SZ) {
             if (cc == -1) {
                 strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("recv: cc %ld %s\n", cc, errbuf);
+                eprint("recv: recmark cc %ld %s\n", cc, errbuf);
                 break;
             }
 
-            eprint("recv: cc %ld short read\n", cc);
+            eprint("recv: recmark cc %ld short read\n", cc);
             rc = EIO;
             break;
         }
 
+        rpc_rm_get(rxbuf, &rmlen, &last);
+
+        cc = recv(fd, rxbuf, rmlen + RPC_RM_SZ, MSG_WAITALL);
+
+        if (cc != rmlen + RPC_RM_SZ) {
+            if (cc == -1) {
+                strerror_r(rc = errno, errbuf, sizeof(errbuf));
+                eprint("recv: cc %ld %s, expected %u\n",
+                       cc, errbuf, rmlen);
+                break;
+            }
+
+            eprint("recv: cc %ld short read, expected %u\n",
+                   cc, rmlen);
+            rc = EIO;
+            break;
+        }
+
+        rxbuf += RPC_RM_SZ;
+
+        stat = rpc_decode(&xdr, rxbuf, rmlen, &rmsg, &rerr);
+
+        if (stat != RPC_SUCCESS) {
+            eprint("recv: msgrx %ld, stat %d\n", msgrx, stat);
+            break;
+        }
+
+        XDR_DESTROY(&xdr);
+
+        if (rmsg.rm_xid != msgrx) {
+            eprint("recv: invalid xid %u, msgrx %ld\n", rmsg.rm_xid, msgrx);
+            break;
+        }
+
+        tdargs->bytes += cc + rpclen + RPC_RM_SZ;
         ++msgrx;
     }
 
     tdargs->iters = msgrx;
+
     return rc;
 }
 
@@ -295,7 +427,7 @@ run(void *arg)
     struct rusage ru_start, ru_stop;
     struct tdargs *tdargs = arg;
     long usecs;
-    int optval;
+    //int optval;
     int fd, rc;
 
     fd = socket(PF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
@@ -312,13 +444,15 @@ run(void *arg)
         abort();
     }
 
-    optval = msglen;
+#if 0
+    optval = msgmax;
     rc = setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &optval, sizeof(optval));
     if (rc) {
         strerror_r(errno, errbuf, sizeof(errbuf));
         eprint("setsockopt(SO_RCVLOWAT): %s\n", errbuf);
         abort();
     }
+#endif
 
     errno = 0;
     rc = pthread_barrier_wait(&bar_start);
@@ -329,9 +463,9 @@ run(void *arg)
     gettimeofday(&tv_start, NULL);
 
     if (async)
-        rc = asrtest(fd, tdargs);
+        rc = nullproc_async(fd, tdargs);
     else
-        rc = srtest(fd, tdargs);
+        rc = nullproc_sync(fd, tdargs);
 
     gettimeofday(&tv_stop, NULL);
     getrusage(RUSAGE_SELF, &ru_stop);
@@ -351,7 +485,7 @@ run(void *arg)
            tdargs->td, fd, usecs,
            tdargs->cpu, (double)tdargs->cpu / tdargs->iters,
            (tdargs->iters * 1000000) / usecs,
-           (msglen * tdargs->iters * 1000000) / usecs,
+           (tdargs->bytes * 1000000) / usecs,
            tdargs->tx_eagain, tdargs->rx_eagain);
 
     close(fd);
@@ -376,6 +510,7 @@ main(int argc, char **argv)
     struct hostent *hent;
     char *server, *user;
     size_t rxbufsz;
+    size_t bytes;
     char *rxbuf;
     long *prxbuf;
     int i;
@@ -484,10 +619,10 @@ main(int argc, char **argv)
         msglag = 1;
     if (msgcnt < 1)
         msgcnt = 1;
-    if (msglen < RPC_RM_SZ + 8)
-        msglen = RPC_RM_SZ + 8;
+    if (msgmax < RPC_RM_SZ + 8)
+        msgmax = RPC_RM_SZ + 8;
 
-    rxbufsz = roundup(msglen, 4096) * 2 * jobs;
+    rxbufsz = roundup(msgmax, 4096) * 2 * jobs;
     rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);
 
     rxbuf = mmap(NULL, rxbufsz, PROT_READ | PROT_WRITE,
@@ -497,6 +632,24 @@ main(int argc, char **argv)
         eprint("mmap: %s\n", errbuf);
         abort();
     }
+
+    if (0 == strcasecmp(auth_type, "sys")) {
+        auth_flavor = AUTH_SYS;
+        auth = authunix_create_default();
+    } else if (0 == strcasecmp(auth_type, "unix")) {
+        auth_flavor = AUTH_UNIX;
+        auth = authunix_create_default();
+    } else if (0 == strcasecmp(auth_type, "none")) {
+        auth_flavor = AUTH_NONE;
+        auth = authnone_create();
+    } else {
+        eprint("invalid auth type %s, use -h for help\n", auth_type);
+        exit(EX_USAGE);
+    }
+
+    rc = rpc_encode(0, NFS3_NULL, auth, rxbuf, rxbufsz);
+    dprint(0, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, sizeof(nfsv3_null auth%s) %d\n",
+           sizeof(struct rpc_msg), sizeof(struct call_body), auth_type, rc);
 
     prxbuf = (long *)rxbuf;
     for (i = 0; i < rxbufsz / sizeof(*prxbuf); i += sizeof(*prxbuf))
@@ -524,7 +677,7 @@ main(int argc, char **argv)
 
         memset(tdargs, 0, sizeof(*tdargs));
         memcpy(&tdargs->faddr, &faddr, sizeof(tdargs->faddr));
-        tdargs->rxbuf = rxbuf + roundup(msglen, 4096) * 2 * i;
+        tdargs->rxbuf = rxbuf + roundup(msgmax, 4096) * 2 * i;
 
         rc = pthread_create(&tdargs->td, NULL, run, tdargs);
         if (rc) {
@@ -533,7 +686,7 @@ main(int argc, char **argv)
         }
     }
 
-    usecs = iters = cpu = 0;
+    bytes = usecs = iters = cpu = 0;
 
     for (i = 0; i < jobs; ++i) {
         struct tdargs *tdargs = tdargv + i;
@@ -541,6 +694,7 @@ main(int argc, char **argv)
 
         rc = pthread_join(tdargs->td, &val);
 
+        bytes += tdargs->bytes;
         iters += tdargs->iters;
         usecs += tdargs->usecs;
         cpu += tdargs->cpu;
@@ -548,14 +702,15 @@ main(int argc, char **argv)
 
     usecs /= jobs;
 
-    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %ld, bytes/sec %ld, cpu/msg %.2lf\n",
+    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %.1lf, bytes/sec %ld, cpu/msg %.2lf\n",
            iters, usecs, cpu,
            (iters * 1000000) / usecs,
-           usecs * jobs / iters,
-           (msglen * iters * 1000000) / usecs,
+           (double)usecs * jobs / iters,
+           (bytes * 1000000) / usecs,
            (double)cpu / iters);
 
     munmap(rxbuf, rxbufsz);
+    auth_destroy(auth);
     free(host);
 
     return 0;
