@@ -172,21 +172,20 @@ rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, void *buf, size_t bufsz)
 
 enum clnt_stat
 rpc_decode(XDR *xdr, char *buf, int len,
-           struct rpc_msg *rpc_msg, struct rpc_err *rpc_err)
+           struct rpc_msg *msg, struct rpc_err *err)
 {
     xdrmem_create(xdr, buf, len, XDR_DECODE);
 
-    rpc_msg->acpted_rply.ar_verf = _null_auth;
-    rpc_msg->acpted_rply.ar_results.where = NULL;
-    rpc_msg->acpted_rply.ar_results.proc = (xdrproc_t)xdr_void;
+    msg->acpted_rply.ar_verf = _null_auth;
+    msg->acpted_rply.ar_results.where = NULL;
+    msg->acpted_rply.ar_results.proc = (xdrproc_t)xdr_void;
 
-    if (xdr_replymsg(xdr, rpc_msg)) {
-        _seterr_reply(rpc_msg, rpc_err);
-    } else {
-        rpc_err->re_status = RPC_CANTDECODERES;
-    }
+    err->re_status = RPC_CANTDECODERES;
 
-    return rpc_err->re_status;
+    if (xdr_replymsg(xdr, msg))
+        _seterr_reply(msg, err);
+
+    return err->re_status;
 }
 
 /* Asynchronous send/recv loop.  Note that the send can race ahead
@@ -197,10 +196,10 @@ nullproc_async(int fd, struct tdargs *tdargs)
 {
     char *rxbuf, *txbuf, errbuf[128];
     ssize_t rxlen, txlen, txfrag, txfragmax, cc;
+    uint32_t rxmax, rxoff, rmlen;
     int rxflags, txflags;
     u_long msgrx, msgtx;
-    uint32_t rmlen;
-    int rpclen;
+    bool last;
     int rc;
 
     rxbuf = tdargs->rxbuf;
@@ -221,7 +220,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
         txfragmax = txlen;
     txfrag = txfragmax;
 
-    rxlen = rmlen = 0;
+    rxmax = rxlen = rmlen = 0;
 
     while (msgrx < msgcnt) {
         if (msgtx < msgcnt && msgtx - msgrx < msglag) {
@@ -258,11 +257,20 @@ nullproc_async(int fd, struct tdargs *tdargs)
          * size of the record fragment.
          */
         if (rmlen == 0) {
-            bool last;
-
             cc = recv(fd, rxbuf, RPC_RM_SZ, MSG_PEEK | rxflags);
-            if (cc < RPC_RM_SZ)
-                continue;
+            if (cc < RPC_RM_SZ) {
+                if (cc > 0)
+                    continue;
+
+                if (cc == -1 && errno == EAGAIN) {
+                    ++tdargs->rx_eagain;
+                    continue;
+                }
+
+                strerror_r(rc = errno, errbuf, sizeof(errbuf));
+                eprint("recv: cc %ld %s\n", cc, errbuf);
+                break;
+            }
 
             rpc_rm_get(rxbuf, &rmlen, &last);
             if (!last) {
@@ -271,31 +279,75 @@ nullproc_async(int fd, struct tdargs *tdargs)
                 break;
             }
 
-            rpclen = rmlen + RPC_RM_SZ;
-            rxlen = rpclen;
+            rxmax = rmlen + RPC_RM_SZ;
+            rxoff = RPC_RM_SZ;
+
+            if (msgtx - msgrx > 2)
+                rxmax += RPC_RM_SZ;
+
+            rxlen = rxmax;
         }
 
-        cc = recv(fd, rxbuf + (rpclen - rxlen), rxlen, rxflags);
-        if (cc != rxlen) {
-            if (cc == 0) {
-                eprint("recv: eof\n");
-                break;
+        cc = recv(fd, rxbuf + (rxmax - rxlen), rxlen, rxflags);
+        if (cc < rxlen) {
+            if (cc > 0) {
+                rxlen -= cc;
+                continue;
             }
 
-            if (errno != EAGAIN) {
-                strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("recv: cc %ld %s\n", cc, errbuf);
-                break;
+            if (cc == -1 && errno == EAGAIN) {
+                ++tdargs->rx_eagain;
+                continue;
             }
 
-            ++tdargs->rx_eagain;
-            continue;
+            strerror_r(rc = errno, errbuf, sizeof(errbuf));
+            eprint("recv: cc %ld %s\n", cc, errbuf);
+            break;
         }
 
         rxlen -= cc;
         if (rxlen == 0) {
-            tdargs->bytes += rmlen;
+            enum clnt_stat stat;
+            struct rpc_msg msg;
+            struct rpc_err err;
+            uint32_t rmlen2 = 0;
+            XDR xdr;
+
+            if (rxmax - rmlen - rxoff > 0) {
+                rpc_rm_get(rxbuf + rmlen + rxoff, &rmlen2, &last);
+                if (!last || rmlen2 == 0) {
+                    eprint("invalid record mark frag, rxlen %ld, rxmax %u, rmlen %u, rxoff %u, rmlen2 %u, msgrx %lu, msgtx %lu\n",
+                           rxlen, rxmax, rmlen, rxoff, rmlen2, msgrx, msgtx);
+                    break;
+                }
+            }
+
+            stat = rpc_decode(&xdr, rxbuf + rxoff, rmlen, &msg, &err);
+
+            if (stat != RPC_SUCCESS) {
+                eprint("recv: msgrx %ld, stat %d\n", msgrx, stat);
+                eprint("rxlen %ld, rxmax %u, rmlen %u, rxoff %u, rmlen2 %u, msgrx %lu, msgtx %lu\n",
+                       rxlen, rxmax, rmlen, rxoff, rmlen2, msgrx, msgtx);
+                break;
+            }
+
+            xdr_destroy(&xdr);
+
+            tdargs->bytes += rmlen + RPC_RM_SZ;
+
             rmlen = 0;
+            rxoff = 0;
+
+            if (rmlen2 > 0) {
+                rmlen = rmlen2;
+                rxmax = rmlen;
+
+                if (msgtx - msgrx > 2)
+                    rxmax += RPC_RM_SZ;
+
+                rxlen = rxmax;
+            }
+
             ++msgrx;
         }
     }
@@ -313,16 +365,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
     char *rxbuf, *txbuf, errbuf[128];
     ssize_t cc;
     long msgrx;
-    int optval;
     int rc;
-
-    optval = RPC_RM_SZ;
-    rc = setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &optval, sizeof(optval));
-    if (rc) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("setsockopt(SO_RCVLOWAT): %s\n", errbuf);
-        abort();
-    }
 
     rxbuf = tdargs->rxbuf;
     txbuf = rxbuf + roundup(msgmax, 4096);
@@ -361,7 +404,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
         /* Peek at the RPC record mark so that we can get the
          * size of the record fragment.
          */
-        cc = recv(fd, rxbuf, RPC_RM_SZ, MSG_PEEK | MSG_WAITALL);
+        cc = recv(fd, rxbuf, RPC_RM_SZ, MSG_WAITALL);
 
         if (cc < RPC_RM_SZ) {
             if (cc == -1) {
@@ -377,13 +420,13 @@ nullproc_sync(int fd, struct tdargs *tdargs)
 
         rpc_rm_get(rxbuf, &rmlen, &last);
 
-        cc = recv(fd, rxbuf, rmlen + RPC_RM_SZ, MSG_WAITALL);
+        cc = recv(fd, rxbuf, rmlen, MSG_WAITALL);
 
-        if (cc != rmlen + RPC_RM_SZ) {
+        if (cc != rmlen) {
             if (cc == -1) {
                 strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("recv: cc %ld %s, expected %u\n",
-                       cc, errbuf, rmlen);
+                eprint("recv: cc %ld, expected %u: %s\n",
+                       cc, rmlen, errbuf);
                 break;
             }
 
@@ -392,8 +435,6 @@ nullproc_sync(int fd, struct tdargs *tdargs)
             rc = EIO;
             break;
         }
-
-        rxbuf += RPC_RM_SZ;
 
         stat = rpc_decode(&xdr, rxbuf, rmlen, &rmsg, &rerr);
 
@@ -648,7 +689,7 @@ main(int argc, char **argv)
     }
 
     rc = rpc_encode(0, NFS3_NULL, auth, rxbuf, rxbufsz);
-    dprint(0, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, sizeof(nfsv3_null auth%s) %d\n",
+    dprint(1, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, sizeof(nfsv3_null auth%s) %d\n",
            sizeof(struct rpc_msg), sizeof(struct call_body), auth_type, rc);
 
     prxbuf = (long *)rxbuf;

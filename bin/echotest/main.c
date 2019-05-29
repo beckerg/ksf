@@ -514,10 +514,10 @@ main(int argc, char **argv)
     usecs /= jobs;
     bytespersec = (msglen * iters * 1000000.0) / usecs;
 
-    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %ld, MBps %.2lf, Gbps %.2lf, cpu/msg %.2lf\n",
+    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %.1lf, MBps %.2lf, Gbps %.2lf, cpu/msg %.2lf\n",
            iters, usecs, cpu,
            (iters * 1000000) / usecs,
-           usecs * jobs / iters,
+           (double)usecs * jobs / iters,
            bytespersec / (1ul << 20),
            (bytespersec * 8) / 1000000000,
            (double)cpu / iters);
