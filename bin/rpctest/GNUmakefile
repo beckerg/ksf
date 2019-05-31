@@ -41,6 +41,7 @@ ifneq ($(wildcard /usr/include/tirpc/rpc/rpc.h),)
 endif
 
 CFLAGS		+= -Wall -g -O2 ${INCLUDE}
+CFLAGS		+= -march=native
 DEBUG		:= -O0 -DDEBUG -UNDEBUG -fno-omit-frame-pointer
 CPPFLAGS	:= ${CDEFS}
 OBJ		:= ${SRC:.c=.o}

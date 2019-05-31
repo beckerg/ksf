@@ -81,14 +81,13 @@ pthread_barrier_t bar_end;
 unsigned int jobs = 1;
 in_port_t port = 62049;
 long duration = 600;
-u_long msgcnt = 300000;
+u_long msgcnt = 1000000;
 size_t msgmax = 128 * 1024;
-size_t msglag = 31;
+size_t msglag = 1;
 enum_t auth_flavor;
 char *auth_type = "none";
 AUTH *auth;
 char *host;
-bool async;
 bool udp;
 
 struct tdargs {
@@ -117,10 +116,9 @@ static clp_option_t optionv[] = {
     CLP_OPTION_HELP,
 
     CLP_OPTION(string, 'A', auth_type, NULL, NULL, "auth type (none, sys, unix)"),
-    CLP_OPTION(bool, 'a', async, NULL, NULL, "asynchronous send/recv mode"),
+    CLP_OPTION(size_t, 'a', msglag, NULL, NULL, "async recv message max lag"),
     CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of concurrent jobs (worker threads)"),
     CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "message count"),
-    CLP_OPTION(size_t, 'L', msglag, NULL, NULL, "async recv message max lag"),
     CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
 
     CLP_OPTION_END
@@ -132,11 +130,6 @@ rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, void *buf, size_t bufsz)
     struct rpc_msg msg;
     XDR xdr;
     int len;
-
-    if (!buf || bufsz < sizeof(msg) + RPC_RM_SZ) {
-        eprint("einval: bufsz %zu\n", bufsz);
-        abort();
-    }
 
     msg.rm_xid = xid;
     msg.rm_direction = CALL;
@@ -153,8 +146,8 @@ rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, void *buf, size_t bufsz)
         msg.rm_call.cb_verf = _null_auth;
     }
 
-    /* Create the serialized RPC message, leaving room at the
-     * front for the RPC record mark.
+    /* Create the serialized RPC message, leaving room at the front
+     * of the buffer for the RPC record mark.
      */
     xdrmem_create(&xdr, buf + RPC_RM_SZ, bufsz - RPC_RM_SZ, XDR_ENCODE);
     len = -1;
@@ -165,17 +158,12 @@ rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, void *buf, size_t bufsz)
         len += RPC_RM_SZ;
     }
 
-    xdr_destroy(&xdr);
-
     return len;
 }
 
 enum clnt_stat
-rpc_decode(XDR *xdr, char *buf, int len,
-           struct rpc_msg *msg, struct rpc_err *err)
+rpc_decode(XDR *xdr, struct rpc_msg *msg, struct rpc_err *err)
 {
-    xdrmem_create(xdr, buf, len, XDR_DECODE);
-
     msg->acpted_rply.ar_verf = _null_auth;
     msg->acpted_rply.ar_results.where = NULL;
     msg->acpted_rply.ar_results.proc = (xdrproc_t)xdr_void;
@@ -221,6 +209,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
     txfrag = txfragmax;
 
     rxmax = rxlen = rmlen = 0;
+    last = false;
 
     while (msgrx < msgcnt) {
         if (msgtx < msgcnt && msgtx - msgrx < msglag) {
@@ -273,15 +262,14 @@ nullproc_async(int fd, struct tdargs *tdargs)
             }
 
             rpc_rm_get(rxbuf, &rmlen, &last);
-            if (!last) {
-                eprint("invalid record mark frag, rmlen %u, msgrx %lu\n",
-                       rmlen, msgrx);
-                break;
-            }
 
             rxmax = rmlen + RPC_RM_SZ;
             rxoff = RPC_RM_SZ;
 
+            /* If we have enough RPC calls in flight then we can read
+             * the record mark for reply message (n + 1) while reading
+             * reply message n.
+             */
             if (msgtx - msgrx > 2)
                 rxmax += RPC_RM_SZ;
 
@@ -311,43 +299,59 @@ nullproc_async(int fd, struct tdargs *tdargs)
             struct rpc_msg msg;
             struct rpc_err err;
             uint32_t rmlen2 = 0;
+            bool last2 = false;
             XDR xdr;
 
             if (rxmax - rmlen - rxoff > 0) {
-                rpc_rm_get(rxbuf + rmlen + rxoff, &rmlen2, &last);
-                if (!last || rmlen2 == 0) {
-                    eprint("invalid record mark frag, rxlen %ld, rxmax %u, rmlen %u, rxoff %u, rmlen2 %u, msgrx %lu, msgtx %lu\n",
+                assert(rxmax - rmlen - rxoff == RPC_RM_SZ);
+
+                rpc_rm_get(rxbuf + rmlen + rxoff, &rmlen2, &last2);
+                if (rmlen2 == 0) {
+                    eprint("invalid record mark: %ld %u %u %u %u %lu %lu\n",
                            rxlen, rxmax, rmlen, rxoff, rmlen2, msgrx, msgtx);
                     break;
                 }
             }
 
-            stat = rpc_decode(&xdr, rxbuf + rxoff, rmlen, &msg, &err);
-
-            if (stat != RPC_SUCCESS) {
-                eprint("recv: msgrx %ld, stat %d\n", msgrx, stat);
-                eprint("rxlen %ld, rxmax %u, rmlen %u, rxoff %u, rmlen2 %u, msgrx %lu, msgtx %lu\n",
-                       rxlen, rxmax, rmlen, rxoff, rmlen2, msgrx, msgtx);
-                break;
-            }
-
-            xdr_destroy(&xdr);
-
             tdargs->bytes += rmlen + RPC_RM_SZ;
 
-            rmlen = 0;
-            rxoff = 0;
+            if (last) {
+                if (rxbuf > tdargs->rxbuf) {
+                    if (rxoff > 0)
+                        memmove(rxbuf, rxbuf + rxoff, rmlen);
+                    rmlen += (rxbuf - tdargs->rxbuf);
+                    rxbuf = tdargs->rxbuf;
+                    rxoff = 0;
+                }
 
-            if (rmlen2 > 0) {
-                rmlen = rmlen2;
-                rxmax = rmlen;
+                xdrmem_create(&xdr, rxbuf + rxoff, rmlen, XDR_DECODE);
 
-                if (msgtx - msgrx > 2)
-                    rxmax += RPC_RM_SZ;
+                stat = rpc_decode(&xdr, &msg, &err);
 
-                rxlen = rxmax;
+                if (stat != RPC_SUCCESS) {
+                    eprint("invalid rpc reply: %ld %u %u %u %u %lu %lu %u: %s\n",
+                           rxlen, rxmax, rmlen, rxoff, rmlen2, msgrx, msgtx, stat,
+                           clnt_sperrno(stat));
+                    break;
+                }
+
+                rxbuf = tdargs->rxbuf;
+            }
+            else {
+                if (rxoff > 0)
+                    memmove(rxbuf, rxbuf + rxoff, rmlen);
+                rxbuf += rmlen;
             }
 
+            rmlen = rmlen2;
+            rxmax = rmlen;
+            last = last2;
+            rxoff = 0;
+
+            if (rmlen > 0 && (msgtx - msgrx) > 2)
+                rxmax += RPC_RM_SZ;
+
+            rxlen = rxmax;
             ++msgrx;
         }
     }
@@ -436,14 +440,14 @@ nullproc_sync(int fd, struct tdargs *tdargs)
             break;
         }
 
-        stat = rpc_decode(&xdr, rxbuf, rmlen, &rmsg, &rerr);
+        xdrmem_create(&xdr, rxbuf, rmlen, XDR_DECODE);
+
+        stat = rpc_decode(&xdr, &rmsg, &rerr);
 
         if (stat != RPC_SUCCESS) {
             eprint("recv: msgrx %ld, stat %d\n", msgrx, stat);
             break;
         }
-
-        XDR_DESTROY(&xdr);
 
         if (rmsg.rm_xid != msgrx) {
             eprint("recv: invalid xid %u, msgrx %ld\n", rmsg.rm_xid, msgrx);
@@ -468,7 +472,6 @@ run(void *arg)
     struct rusage ru_start, ru_stop;
     struct tdargs *tdargs = arg;
     long usecs;
-    //int optval;
     int fd, rc;
 
     fd = socket(PF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
@@ -485,16 +488,6 @@ run(void *arg)
         abort();
     }
 
-#if 0
-    optval = msgmax;
-    rc = setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &optval, sizeof(optval));
-    if (rc) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("setsockopt(SO_RCVLOWAT): %s\n", errbuf);
-        abort();
-    }
-#endif
-
     errno = 0;
     rc = pthread_barrier_wait(&bar_start);
     if (rc && errno)
@@ -503,7 +496,7 @@ run(void *arg)
     getrusage(RUSAGE_SELF, &ru_start);
     gettimeofday(&tv_start, NULL);
 
-    if (async)
+    if (msglag > 0)
         rc = nullproc_async(fd, tdargs);
     else
         rc = nullproc_sync(fd, tdargs);
@@ -656,8 +649,6 @@ main(int argc, char **argv)
 #endif
 #endif
 
-    if (msglag < 1)
-        msglag = 1;
     if (msgcnt < 1)
         msgcnt = 1;
     if (msgmax < RPC_RM_SZ + 8)

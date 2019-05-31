@@ -11,6 +11,8 @@ VPATH = ../lib
 
 CFLAGS	+= -DKSF_MOD=${KMOD} -DKSF_MOD_NAME=\"${KMOD}\"
 CFLAGS	+= -I../lib -I../../include
+CFLAGS	+= -march=native
+
 #CFLAGS	+= -DINVARIANTS
 #CFLAGS	+= -DDIAGNOSTIC
 #CFLAGS	+= -O0 -g -fno-omit-frame-pointer
