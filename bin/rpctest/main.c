@@ -84,6 +84,7 @@ long duration = 600;
 u_long msgcnt = 1000000;
 size_t msgmax = 128 * 1024;
 size_t msglag = 1;
+bool fragged = false;
 enum_t auth_flavor;
 char *auth_type = "none";
 AUTH *auth;
@@ -116,18 +117,20 @@ static clp_option_t optionv[] = {
     CLP_OPTION_HELP,
 
     CLP_OPTION(string, 'A', auth_type, NULL, NULL, "auth type (none, sys, unix)"),
-    CLP_OPTION(size_t, 'a', msglag, NULL, NULL, "async recv message max lag"),
-    CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of concurrent jobs (worker threads)"),
-    CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "message count"),
+    CLP_OPTION(size_t, 'a', msglag, NULL, NULL, "max number of inflight RPCs (per thread)"),
+    CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "max messages to send (per thread)"),
+    CLP_OPTION(bool, 'f', fragged, NULL, NULL, "break each RPC into three records"),
+    CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of threads/connections"),
     CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
 
     CLP_OPTION_END
 };
 
 int
-rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, void *buf, size_t bufsz)
+rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, char *buf, size_t bufsz)
 {
     struct rpc_msg msg;
+    size_t offset;
     XDR xdr;
     int len;
 
@@ -146,15 +149,43 @@ rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, void *buf, size_t bufsz)
         msg.rm_call.cb_verf = _null_auth;
     }
 
-    /* Create the serialized RPC message, leaving room at the front
-     * of the buffer for the RPC record mark.
+    /* If fragged is true then we'll send the RPC message as three
+     * RPC record fragments, where the first and last fragment
+     * contain just the first/last byte of the RPC message.
      */
-    xdrmem_create(&xdr, buf + RPC_RM_SZ, bufsz - RPC_RM_SZ, XDR_ENCODE);
+    offset = RPC_RM_SZ;
+    if (fragged)
+        offset *= 2;
+
+    if (bufsz < offset || !buf)
+        return -1;
+
+    /* Create the serialized RPC message, leaving sufficient space
+     * at the front of the buffer for the record mark(s).
+     */
+    xdrmem_create(&xdr, buf + offset, bufsz - offset, XDR_ENCODE);
     len = -1;
 
     if (xdr_callmsg(&xdr, &msg)) {
         len = xdr_getpos(&xdr);
-        rpc_rm_set(buf, len, true);
+
+        if (fragged) {
+            char c = buf[offset + len - 1];
+
+            rpc_rm_set(buf, 1, false);
+            buf[RPC_RM_SZ] = buf[offset];
+
+            rpc_rm_set(buf + RPC_RM_SZ + 1, len - 2, false);
+
+            rpc_rm_set(buf + offset + len - 1, 1, true);
+            buf[offset + len - 1 + RPC_RM_SZ] = c;
+
+            len += RPC_RM_SZ * 2;
+        }
+        else {
+            rpc_rm_set(buf, len, true);
+        }
+
         len += RPC_RM_SZ;
     }
 
@@ -197,7 +228,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
     msgrx = msgtx = 0;
     rc = 0;
 
-    txlen = rpc_encode(msgtx, NFS3_NULL, auth, txbuf, msgmax);
+    txlen = rpc_encode(msgcnt + 1, NFS3_NULL, auth, txbuf, msgmax);
     if (txlen == -1) {
         eprint("rpc_encode: txlen %ld, msgtx %ld\n", txlen, msgtx);
         abort();
@@ -385,7 +416,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
         bool last;
         XDR xdr;
 
-        rpclen = rpc_encode(msgrx, NFS3_NULL, auth, txbuf, msgmax);
+        rpclen = rpc_encode(msgcnt + 1, NFS3_NULL, auth, txbuf, msgmax);
         if (rpclen == -1) {
             eprint("rpc_encode: len %d, msgrx %ld\n", rpclen, msgrx);
             abort();
@@ -679,7 +710,7 @@ main(int argc, char **argv)
         exit(EX_USAGE);
     }
 
-    rc = rpc_encode(0, NFS3_NULL, auth, rxbuf, rxbufsz);
+    rc = rpc_encode(msgcnt, NFS3_NULL, auth, rxbuf, rxbufsz);
     dprint(1, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, sizeof(nfsv3_null auth%s) %d\n",
            sizeof(struct rpc_msg), sizeof(struct call_body), auth_type, rc);
 
