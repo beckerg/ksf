@@ -100,8 +100,11 @@ kecho_recv_tcp(struct xx_conn *conn)
 
     if (rc || !m) {
         if (rc != EWOULDBLOCK) {
-            dprint("soreceive: tcp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-                   conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+            if (rc) {
+                dprint("soreceive: tcp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
+                       conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+            }
+
             conn->active = false;
             xx_conn_rele(conn);
         }
@@ -153,8 +156,11 @@ kecho_recv_udp(struct xx_conn *conn)
 
     if (rc || !m) {
         if (rc != EWOULDBLOCK) {
-            dprint("soreceive: udp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-                   conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+            if (rc) {
+                dprint("soreceive: udp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
+                       conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+            }
+
             conn->active = false;
             xx_conn_rele(conn);
         }

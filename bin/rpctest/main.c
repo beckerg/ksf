@@ -60,6 +60,8 @@
 #include <rpcsvc/nfs_prot.h>
 
 #ifdef __FreeBSD__
+//#define USE_TSC
+
 #include <sys/sysctl.h>
 #endif
 
@@ -67,6 +69,7 @@
 #include "clp.h"
 #include "ksf.h"
 
+#define MSGLAG_MAX  (1024)
 #define NFS3_NULL   (0)
 
 char version[] = PROG_VERSION;
@@ -90,6 +93,7 @@ char *auth_type = "none";
 AUTH *auth;
 char *host;
 bool udp;
+uint64_t tsc_freq = 1000000;
 
 struct tdargs {
     struct sockaddr_in faddr;
@@ -101,7 +105,9 @@ struct tdargs {
     long cpu;
     long tx_eagain;
     long rx_eagain;
-};
+    uint64_t latency;
+    uint64_t startv[MSGLAG_MAX];
+} __aligned(CACHE_LINE_SIZE);
 
 static clp_posparam_t posparamv[] = {
     { .name = "host",
@@ -125,6 +131,18 @@ static clp_option_t optionv[] = {
 
     CLP_OPTION_END
 };
+
+#ifdef USE_TSC
+static inline uint64_t
+rdtsc(void)
+{
+    uint32_t low, high;
+
+    __asm __volatile("rdtsc" : "=a" (low), "=d" (high));
+
+    return (low | ((u_int64_t)high << 32));
+}
+#endif
 
 int
 rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, char *buf, size_t bufsz)
@@ -218,6 +236,8 @@ nullproc_async(int fd, struct tdargs *tdargs)
     uint32_t rxmax, rxoff, rmlen;
     int rxflags, txflags;
     u_long msgrx, msgtx;
+    uint64_t latency;
+    uint64_t *startv;
     bool last;
     int rc;
 
@@ -228,22 +248,30 @@ nullproc_async(int fd, struct tdargs *tdargs)
     msgrx = msgtx = 0;
     rc = 0;
 
-    txlen = rpc_encode(msgcnt + 1, NFS3_NULL, auth, txbuf, msgmax);
-    if (txlen == -1) {
-        eprint("rpc_encode: txlen %ld, msgtx %ld\n", txlen, msgtx);
-        abort();
-    }
-
-    txfragmax = 8192;
-    if (txfragmax > txlen)
-        txfragmax = txlen;
-    txfrag = txfragmax;
-
     rxmax = rxlen = rmlen = 0;
     last = false;
 
+    startv = tdargs->startv;
+    latency = 0;
+
+    txfragmax = 8192;
+    txlen = 0;
+
     while (msgrx < msgcnt) {
         if (msgtx < msgcnt && msgtx - msgrx < msglag) {
+            if (txlen == 0) {
+#ifdef USE_TSC
+                startv[msgtx % MSGLAG_MAX] = rdtsc();
+#endif
+
+                txlen = rpc_encode(msgtx, NFS3_NULL, auth, txbuf, msgmax);
+
+                txfragmax = 8192;
+                if (txfragmax > txlen)
+                    txfragmax = txlen;
+                txfrag = txfragmax;
+            }
+
             cc = send(fd, txbuf + (txfragmax - txfrag), txfrag, txflags);
             if (cc == -1) {
                 if (errno != EAGAIN) {
@@ -256,18 +284,10 @@ nullproc_async(int fd, struct tdargs *tdargs)
             }
             else {
                 tdargs->bytes += cc;
-                txlen -= cc;
-                if (txlen == 0) {
-                    ++msgtx;
-                    txlen = rpc_encode(msgtx, NFS3_NULL, auth, txbuf, msgmax);
-                }
-
                 txfrag -= cc;
-                if (txfrag == 0) {
-                    txfrag = txfragmax;
-                    if (txfrag > txlen)
-                        txfrag = txlen;
-                }
+                txlen -= cc;
+                if (txlen == 0)
+                    ++msgtx;
             }
         }
 
@@ -366,7 +386,13 @@ nullproc_async(int fd, struct tdargs *tdargs)
                     break;
                 }
 
+#ifdef USE_TSC
+                latency += rdtsc() - startv[msg.rm_xid % MSGLAG_MAX];
+                startv[msg.rm_xid % MSGLAG_MAX] = 0;
+#endif
+
                 rxbuf = tdargs->rxbuf;
+                ++msgrx;
             }
             else {
                 if (rxoff > 0)
@@ -383,10 +409,10 @@ nullproc_async(int fd, struct tdargs *tdargs)
                 rxmax += RPC_RM_SZ;
 
             rxlen = rxmax;
-            ++msgrx;
         }
     }
 
+    tdargs->latency = latency;
     tdargs->iters = msgrx;
 
     return rc;
@@ -574,10 +600,12 @@ main(int argc, char **argv)
     struct tdargs *tdargv;
     struct hostent *hent;
     char *server, *user;
+    uint64_t latency;
+    size_t tdargvsz;
     size_t rxbufsz;
     size_t bytes;
-    char *rxbuf;
     long *prxbuf;
+    char *rxbuf;
     int i;
 
     char errbuf[128];
@@ -684,6 +712,8 @@ main(int argc, char **argv)
         msgcnt = 1;
     if (msgmax < RPC_RM_SZ + 8)
         msgmax = RPC_RM_SZ + 8;
+    if (msglag > MSGLAG_MAX)
+        msglag = MSGLAG_MAX;
 
     rxbufsz = roundup(msgmax, 4096) * 2 * jobs;
     rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);
@@ -718,9 +748,16 @@ main(int argc, char **argv)
     for (i = 0; i < rxbufsz / sizeof(*prxbuf); i += sizeof(*prxbuf))
         *prxbuf++ = (long)(rxbuf + i);
 
-    tdargv = malloc(sizeof(*tdargv) * jobs);
-    if (!tdargv)
+    tdargvsz = roundup(sizeof(*tdargv) * jobs, 4096);
+    tdargvsz = roundup(tdargvsz, 1024 * 1024 * 2);
+
+    tdargv = mmap(NULL, tdargvsz, PROT_READ | PROT_WRITE,
+                  MAP_ALIGNED_SUPER | MAP_SHARED | MAP_ANON, -1, 0);
+    if (tdargv == MAP_FAILED) {
+        strerror_r(errno, errbuf, sizeof(errbuf));
+        eprint("mmap: %s\n", errbuf);
         abort();
+    }
 
     rc = pthread_barrier_init(&bar_start, NULL, jobs);
     if (rc)
@@ -749,7 +786,7 @@ main(int argc, char **argv)
         }
     }
 
-    bytes = usecs = iters = cpu = 0;
+    latency = bytes = usecs = iters = cpu = 0;
 
     for (i = 0; i < jobs; ++i) {
         struct tdargs *tdargs = tdargv + i;
@@ -760,18 +797,21 @@ main(int argc, char **argv)
         bytes += tdargs->bytes;
         iters += tdargs->iters;
         usecs += tdargs->usecs;
+        latency += tdargs->latency;
         cpu += tdargs->cpu;
     }
 
     usecs /= jobs;
 
-    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %.1lf, bytes/sec %ld, cpu/msg %.2lf\n",
+    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %.1lf/%.1lf, bytes/sec %ld, cpu/msg %.2lf\n",
            iters, usecs, cpu,
            (iters * 1000000) / usecs,
            (double)usecs * jobs / iters,
+           (latency * 1000000.0) / (iters * tsc_freq),
            (bytes * 1000000) / usecs,
            (double)cpu / iters);
 
+    munmap(tdargv, tdargvsz);
     munmap(rxbuf, rxbufsz);
     auth_destroy(auth);
     free(host);

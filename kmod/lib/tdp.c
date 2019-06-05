@@ -31,22 +31,19 @@
 #include <sys/lock.h>
 #include <sys/malloc.h>
 #include <sys/mutex.h>
-#include <sys/sx.h>
-#include <sys/rmlock.h>
-#include <sys/rwlock.h>
 #include <sys/proc.h>
 #include <sys/condvar.h>
 #include <sys/sched.h>
+#include <sys/sdt.h>
+#include <sys/smp.h>
 #include <vm/uma.h>
 #include <sys/unistd.h>
 #include <machine/stdarg.h>
 #include <sys/sysctl.h>
-#include <sys/smp.h>
 #include <sys/cpuset.h>
 #include <sys/sbuf.h>
 #include <sys/mman.h>
 #include <sys/module.h>
-#include <netinet/in.h>
 
 #include <sys/mbuf.h>
 #include <sys/socket.h>
@@ -58,8 +55,6 @@
 
 MALLOC_DEFINE(M_XX_TDP, "xx_tdp", "xx thread pool");
 
-#define XX_TDP_WORKQ_MAX        (16)
-
 struct xx_tdargs {
     void      (*func)(void *arg);
     void       *argv[4];
@@ -68,6 +63,10 @@ struct xx_tdargs {
     cpuset_t    cpuset;
 };
 
+/* A thread group manages a work queue and zero or more threads
+ * that are affined to one core (except that maintence thread
+ * group whose threads can run on any vCPU).
+ */
 struct xx_tdp_workq {
     struct mtx                  mtx;
     STAILQ_HEAD(, xx_tdp_work)  head;
@@ -82,14 +81,29 @@ struct xx_tdp_workq {
     u_long                      callbacks;
     u_long                      grows;
     struct cv                   cv;
-    struct xx_tdargs            tdargs;
     struct xx_tdp_work          grow;
+
+    struct xx_tdargs            tdargs;
+
+    /* Add extra padding so that the size is an odd number
+     * of cache lines.
+     */
+    char                        pad[CACHE_LINE_SIZE];
 } __aligned(CACHE_LINE_SIZE);
 
+
 struct xx_tdp {
+#if MAXCPU > 256
+    uint16_t                cpu2workq[MAXCPU];
+#else
+    uint8_t                 cpu2workq[MAXCPU];
+#endif
     int                     refcnt;
+    int                     cgmax;
+    size_t                  allocsz;
     void                   *magic;
-    struct xx_tdp_workq     workqv[XX_TDP_WORKQ_MAX + 1];
+
+    struct xx_tdp_workq     workqv[];
 };
 
 static cpuset_t xx_tdp_cpuset;
@@ -97,7 +111,9 @@ static cpuset_t xx_tdp_cpuset;
 static __always_inline struct xx_tdp_workq *
 xx_tdp_cpu2workq(struct xx_tdp *tdp, int cpu)
 {
-    return tdp->workqv + ((cpu / 2) % XX_TDP_WORKQ_MAX);
+    uint8_t idx = tdp->cpu2workq[cpu % MAXCPU];
+
+    return tdp->workqv + idx;
 }
 
 /* Create and start a kernel thread.
@@ -154,13 +170,13 @@ xx_tdp_rele(struct xx_tdp *tdp)
      */
     tsleep(tdp, 0, "tdpwait", 1);
 
-    for (i = 0; i < XX_TDP_WORKQ_MAX + 1; ++i) {
+    for (i = 0; i < tdp->cgmax + 1; ++i) {
         mtx_destroy(&tdp->workqv[i].mtx);
         cv_destroy(&tdp->workqv[i].cv);
     }
 
     tdp->magic = NULL;
-    free(tdp, M_XX_TDP);
+    contigfree(tdp, tdp->allocsz, M_XX_TDP);
 }
 
 static void
@@ -208,7 +224,7 @@ xx_tdp_enqueue(struct xx_tdp_work *work, int cpu)
     mtx_unlock(&workq->mtx);
 
     if (work) {
-        workq = tdp->workqv + XX_TDP_WORKQ_MAX;
+        workq = tdp->workqv + tdp->cgmax;
 
         xx_tdp_hold(tdp);
 
@@ -228,7 +244,7 @@ xx_tdp_shutdown(struct xx_tdp *tdp)
     KASSERT(tdp->magic == tdp, "invalid tdp magic");
     KASSERT(tdp->refcnt > 0, "invalid tdp refcnt");
 
-    for (i = 0; i < XX_TDP_WORKQ_MAX + 1; ++i) {
+    for (i = 0; i < tdp->cgmax + 1; ++i) {
         struct xx_tdp_workq *workq = tdp->workqv + i;
 
         if (workq->callbacks > 0)
@@ -243,7 +259,7 @@ xx_tdp_shutdown(struct xx_tdp *tdp)
         mtx_unlock(&workq->mtx);
     }
 
-    for (i = 0; i < XX_TDP_WORKQ_MAX + 1; ++i) {
+    for (i = 0; i < tdp->cgmax + 1; ++i) {
         struct xx_tdp_workq *workq = tdp->workqv + i;
 
         mtx_lock(&workq->mtx);
@@ -299,9 +315,13 @@ xx_tdp_run(void *arg)
     kthread_exit();
 }
 
+extern struct cpu_group *smp_topo(void);
+extern struct cpu_group *smp_topo_find(struct cpu_group *, int);
+
 struct xx_tdp *
 xx_tdp_create(u_int tdmin, u_int tdmax)
 {
+    struct cpu_group *cpu_top, **cgv;
     struct xx_tdp_workq *workq;
     struct xx_tdargs *tdargs;
     struct xx_tdp *tdp;
@@ -309,9 +329,16 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
     struct thread *td;
     struct proc *proc;
     int i, rc, width;
+    size_t tdpsz;
+    int cgmax;
 
     if (tdmin > 1024 || tdmax > 1024)
         return NULL;
+
+    if (tdmax < tdmin)
+        tdmax = tdmin;
+    if (tdmax < 1)
+        tdmax = 1;
 
     rc = cpuset_which(CPU_WHICH_CPUSET, -1, &proc, &td, &set);
     if (rc) {
@@ -322,16 +349,32 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
     CPU_COPY(&set->cs_mask, &xx_tdp_cpuset);
     cpuset_rel(set);
 
-    tdmax = (tdmax > tdmin) ? tdmax : tdmin;
+    /* Count the number of cpu groups which we'll use as the number
+     * of thread groups.
+     */
+    cgmax = 0;
+    cpu_top = smp_topo();
+    CPU_FOREACH(i)
+        ++cgmax;
 
-    tdp = malloc(sizeof(*tdp), M_XX_TDP, M_ZERO | M_WAITOK);
-    if (!tdp)
+    cgv = malloc(sizeof(*cgv) * cgmax, M_XX_TDP, M_ZERO);
+    if (!cgv)
         return NULL;
 
+    tdpsz = sizeof(*tdp) + sizeof(tdp->workqv[0]) * (cgmax + 1);
+
+    tdp = contigmalloc(tdpsz, M_XX_TDP, M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+    if (!tdp) {
+        free(cgv, M_XX_TDP);
+        return NULL;
+    }
+
     tdp->refcnt = 2;
+    tdp->cgmax = cgmax;
+    tdp->allocsz = tdpsz;
     tdp->magic = tdp;
 
-    for (i = 0; i < XX_TDP_WORKQ_MAX + 1; ++i) {
+    for (i = 0; i < cgmax + 1; ++i) {
         workq = tdp->workqv + i;
 
         mtx_init(&workq->mtx, "wqmtx", NULL, MTX_DEF);
@@ -352,22 +395,50 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
         workq->grow.tdp = tdp;
         workq->grow.func = xx_tdp_grow;
         workq->grow.argv[0] = workq;
-    }
 
-    /* For each vCPU, find the work queue to which it hashes
-     * and add it to the work queue's cpu-affinity set.
-     */
-    for (i = 0; i < CPU_COUNT(&xx_tdp_cpuset); ++i) {
-        if (CPU_ISSET(i, &xx_tdp_cpuset)) {
-            workq = xx_tdp_cpu2workq(tdp, i);
-            tdargs = &workq->tdargs;
-
-            CPU_SET(i, &tdargs->cpuset);
+        if (i == cgmax) {
+            strlcpy(tdargs->name, "tdp-maint", sizeof(tdargs->name));
+            tdargs->prio = PRI_MAX_KERN - 1;
+            workq->tdmin = 1;
+            workq->tdmax = 1;
         }
     }
 
+    /* For each vCPU, find the thread group to which it belongs
+     * and add it to the vcpu-to-thread-group map and the thead
+     * group's affinity set.
+     */
+    for (i = 0; i < CPU_COUNT(&xx_tdp_cpuset); ++i) {
+        struct cpu_group *cg;
+        int j;
+
+        if (!CPU_ISSET(i, &xx_tdp_cpuset))
+            continue;
+
+        cg = smp_topo_find(cpu_top, i);
+        if (!cg)
+            continue;
+
+        for (j = 0; j < cgmax; ++j) {
+            if (!cgv[j] || cg == cgv[j])
+                break;
+        }
+
+        if (!cgv[j])
+            cgv[j] = cg;
+
+        tdp->cpu2workq[i] = j;
+
+        workq = xx_tdp_cpu2workq(tdp, i);
+        tdargs = &workq->tdargs;
+
+        CPU_SET(i, &tdargs->cpuset);
+    }
+
+    /* Ensure that each thread group's affinity set is non-zero.
+     */
     width = 0;
-    for (i = 0; i < XX_TDP_WORKQ_MAX; ++i) {
+    for (i = 0; i < cgmax + 1; ++i) {
         char buf[CPUSETBUFSIZ];
 
         workq = tdp->workqv + i;
@@ -381,38 +452,43 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
             width = strlen(buf);
     }
 
-    for (i = 0; i < XX_TDP_WORKQ_MAX; ++i) {
+    for (i = 0; i < cgmax + 1; ++i) {
         char buf[CPUSETBUFSIZ];
 
         workq = tdp->workqv + i;
         tdargs = &workq->tdargs;
 
-        dprint("workq %2d  %*s\n", i, width, cpusetobj_strprint(buf, &tdargs->cpuset));
+        dprint("workq %3d %12s  %2u %2u  %*s\n",
+               i, tdargs->name, workq->tdmin, workq->tdmax,
+               width, cpusetobj_strprint(buf, &tdargs->cpuset));
     }
-
 
     /* Start the maintenance kthread.
      */
-    workq = tdp->workqv + XX_TDP_WORKQ_MAX;
+    workq = tdp->workqv + cgmax;
     tdargs = &workq->tdargs;
-    CPU_COPY(&xx_tdp_cpuset, &tdargs->cpuset);
-    strlcpy(tdargs->name, "tdp-maint", sizeof(tdargs->name));
-    tdargs->prio = PRI_MAX_KERN - 1;
-    workq->tdmin = 1;
-    workq->tdmax = 1;
 
     rc = xx_tdp_kthread_create(tdargs);
     if (rc) {
         dprint("unable to create maint kthread: rc %d\n", rc);
         free(tdp, M_XX_TDP);
+        free(cgv, M_XX_TDP);
         return NULL;
     }
 
     dprint("%s: %4zu  sizeof xx_tdargs\n", __func__, sizeof(struct xx_tdargs));
     dprint("%s: %4zu  sizeof xx_tdp_work\n", __func__, sizeof(struct xx_tdp_work));
     dprint("%s: %4zu  sizeof xx_tdp_workq\n", __func__, sizeof(struct xx_tdp_workq));
+    dprint("%s: %4zu  sizeof xx_tdp_tdp\n", __func__, sizeof(struct xx_tdp));
 
     dprint("tdmin %u, tdmax %u, refcnt %d\n", tdmin, tdmax, tdp->refcnt);
+
+    /* Consider adjusting the xx_tdp_workq padding if you see this message.
+     */
+    if ((sizeof(struct xx_tdp_workq) & 1) == 0)
+        dprint("struct xx_tdp_workq is an even number of cache lines\n");
+
+    free(cgv, M_XX_TDP);
 
     return tdp;
 }

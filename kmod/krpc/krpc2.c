@@ -81,8 +81,10 @@ struct conn_priv {
     struct mbuf    *last;
     struct mbuf    *msg;
     struct mbuf    *hdr;
-    u_long  nrcvlowat;
     int     rcvlowat;
+    u_long  nrcvlowat;
+    u_long  nmisaligned;
+    u_long  pad;
 
     struct mtx                  txq_mtx;
     STAILQ_HEAD(, xx_tdp_work)  txq_head;
@@ -97,12 +99,15 @@ krpc_send(struct xx_tdp_work *work)
 {
     struct conn_priv *priv;
     struct xx_conn *conn;
-    int sndpercall = 8;
+    int sndpercall = 128;
     struct mbuf *h;
+    int errs = 0;
     int rc;
 
   again:
     conn = work->argv[0];
+    priv = xx_conn_priv(conn);
+
     h = work->argv[1];
     m_fixhdr(h);
 
@@ -110,12 +115,12 @@ krpc_send(struct xx_tdp_work *work)
     h->m_len += RPC_RM_SZ;
 
     rc = sosend(conn->so, NULL, NULL, h, NULL, 0, curthread);
-    if (rc) {
-        eprint("sosend; conn %p, rc %d, %lu %lu\n",
-               conn, rc, conn->nsoupcalls, conn->ncallbacks);
-    }
 
-    priv = xx_conn_priv(conn);
+    if (rc && (errs++ % 8) == 0) {
+        dprint("sosend: conn %p, rc %d, %lu %lu, %lu %lu\n",
+               conn, rc, conn->nsoupcalls, conn->ncallbacks,
+               priv->nrcvlowat, priv->nmisaligned);
+    }
 
     mtx_lock(&priv->txq_mtx);
     work = STAILQ_FIRST(&priv->txq_head);
@@ -224,7 +229,6 @@ krpc_recv_tcp(struct xx_conn *conn)
     struct socket *so = conn->so;
     struct conn_priv *priv;
     u_int fraglen, reclen;
-    int rcvpercall = 8;
     struct mbuf *m;
     struct uio uio;
     bool reclast;
@@ -234,7 +238,6 @@ krpc_recv_tcp(struct xx_conn *conn)
 
     priv = xx_conn_priv(conn);
 
-  again:
     uio.uio_resid = IP_MAXPACKET;
     uio.uio_td = curthread;
     flags = MSG_DONTWAIT;
@@ -244,9 +247,12 @@ krpc_recv_tcp(struct xx_conn *conn)
 
     if (rc || !m) {
         if (rc != EWOULDBLOCK) {
-            dprint("soreceive: conn %p, rc %d, m %p, flags %x, %lu %lu, %lu\n",
-                   conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks,
-                   priv->nrcvlowat);
+            if (rc) {
+                dprint("soreceive: conn %p, rc %d, m %p, flags %x, %lu %lu, %lu %lu\n",
+                       conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks,
+                       priv->nrcvlowat, priv->nmisaligned);
+            }
+
             conn->active = false;
             xx_conn_rele(conn);
         }
@@ -256,11 +262,10 @@ krpc_recv_tcp(struct xx_conn *conn)
 
     /* Append new data to the current record fragment.
      */
-    if (priv->last) {
+    if (priv->last)
         m_cat(priv->last, m);
-    } else {
+    else
         priv->frag = m;
-    }
 
   more:
     fraglen = m_length(priv->frag, &priv->last);
@@ -278,9 +283,6 @@ krpc_recv_tcp(struct xx_conn *conn)
         if (priv->rcvlowat > 4096)
             priv->rcvlowat = 4096;
         xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
-
-        if (--rcvpercall > 0)
-            goto again;
         return;
     }
 
@@ -293,6 +295,9 @@ krpc_recv_tcp(struct xx_conn *conn)
     priv->frag = m_split(m, reclen, M_WAITOK);
     if (!priv->frag)
         priv->last = NULL;
+
+    if (mtod(m, uintptr_t) & 0x03)
+        ++priv->nmisaligned;
 
     /* Accumulate RPC records until we see the last record.
      */

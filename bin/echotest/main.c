@@ -64,6 +64,8 @@
 #include "main.h"
 #include "clp.h"
 
+#define MSGLAG_MAX  (1024)
+
 char version[] = PROG_VERSION;
 char *progname;
 int verbosity;
@@ -75,9 +77,8 @@ pthread_barrier_t bar_start;
 pthread_barrier_t bar_end;
 unsigned int jobs = 1;
 in_port_t port = 60007;
-long duration = 600;
-u_long msgcnt = 300000;
-size_t msglag = 128;
+u_long msgcnt = 1000000;
+size_t msglag = 1;
 size_t msglen = 1;
 char *host;
 bool async;
@@ -92,6 +93,8 @@ struct tdargs {
     long cpu;
     long tx_eagain;
     long rx_eagain;
+    uint64_t latency;
+    uint64_t startv[MSGLAG_MAX];
 };
 
 static clp_posparam_t posparamv[] = {
@@ -107,10 +110,9 @@ static clp_option_t optionv[] = {
     CLP_OPTION_VERSION(version),
     CLP_OPTION_HELP,
 
-    CLP_OPTION(bool, 'a', async, NULL, NULL, "asynchronous send/recv mode"),
-    CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of concurrent jobs (worker threads)"),
-    CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "message count"),
-    CLP_OPTION(size_t, 'L', msglag, NULL, NULL, "async recv message max lag"),
+    CLP_OPTION(size_t, 'a', msglag, NULL, NULL, "max number of inflight msgs (per thread)"),
+    CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "max messages to send (per thread)"),
+    CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of threads/connections"),
     CLP_OPTION(size_t, 'l', msglen, NULL, NULL, "message length"),
     CLP_OPTION(uint16_t, 'p', port, NULL, NULL, "remote port"),
     CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
@@ -123,7 +125,7 @@ static clp_option_t optionv[] = {
  * of the receiver by at most msglag messages.
  */
 int
-asrtest(int fd, struct tdargs *tdargs)
+test_async(int fd, struct tdargs *tdargs)
 {
     char *rxbuf, *txbuf, errbuf[128];
     ssize_t rxlen, txlen, txfrag, txfragmax, cc;
@@ -195,13 +197,14 @@ asrtest(int fd, struct tdargs *tdargs)
     }
 
     tdargs->iters = msgrx;
+
     return rc;
 }
 
 /* Synchronous send/recv loop...
  */
 int
-srtest(int fd, struct tdargs *tdargs)
+test_sync(int fd, struct tdargs *tdargs)
 {
     char *rxbuf, *txbuf, errbuf[128];
     ssize_t cc;
@@ -290,10 +293,10 @@ run(void *arg)
     getrusage(RUSAGE_SELF, &ru_start);
     gettimeofday(&tv_start, NULL);
 
-    if (async)
-        rc = asrtest(fd, tdargs);
+    if (msglag > 0)
+        rc = test_async(fd, tdargs);
     else
-        rc = srtest(fd, tdargs);
+        rc = test_sync(fd, tdargs);
 
     gettimeofday(&tv_stop, NULL);
     getrusage(RUSAGE_SELF, &ru_stop);
@@ -340,6 +343,7 @@ main(int argc, char **argv)
     struct hostent *hent;
     char *server, *user;
     double bytespersec;
+    size_t tdargvsz;
     size_t rxbufsz;
     char *rxbuf;
     long *prxbuf;
@@ -445,12 +449,12 @@ main(int argc, char **argv)
 #endif
 #endif
 
-    if (msglag < 1)
-        msglag = 1;
     if (msgcnt < 1)
         msgcnt = 1;
     if (msglen < 1)
         msglen = 1;
+    if (msglag > MSGLAG_MAX)
+        msglag = MSGLAG_MAX;
 
     rxbufsz = roundup(msglen, 4096) * 2 * jobs;
     rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);
@@ -467,9 +471,16 @@ main(int argc, char **argv)
     for (i = 0; i < rxbufsz / sizeof(*prxbuf); i += sizeof(*prxbuf))
         *prxbuf++ = (long)(rxbuf + i);
 
-    tdargv = malloc(sizeof(*tdargv) * jobs);
-    if (!tdargv)
+    tdargvsz = roundup(sizeof(*tdargv) * jobs, 4096);
+    tdargvsz = roundup(tdargvsz, 1024 * 1024 * 2);
+
+    tdargv = mmap(NULL, tdargvsz, PROT_READ | PROT_WRITE,
+                  MAP_ALIGNED_SUPER | MAP_SHARED | MAP_ANON, -1, 0);
+    if (tdargv == MAP_FAILED) {
+        strerror_r(errno, errbuf, sizeof(errbuf));
+        eprint("mmap: %s\n", errbuf);
         abort();
+    }
 
     rc = pthread_barrier_init(&bar_start, NULL, jobs);
     if (rc)
@@ -522,6 +533,7 @@ main(int argc, char **argv)
            (bytespersec * 8) / 1000000000,
            (double)cpu / iters);
 
+    munmap(tdargv, tdargvsz);
     munmap(rxbuf, rxbufsz);
     free(host);
 
