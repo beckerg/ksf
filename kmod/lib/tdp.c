@@ -480,12 +480,15 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
     dprint("%s: %4zu  sizeof xx_tdp_work\n", __func__, sizeof(struct xx_tdp_work));
     dprint("%s: %4zu  sizeof xx_tdp_workq\n", __func__, sizeof(struct xx_tdp_workq));
     dprint("%s: %4zu  sizeof xx_tdp_tdp\n", __func__, sizeof(struct xx_tdp));
+    dprint("%s: %4u  MSIZE\n", __func__, MSIZE);
+    dprint("%s: %4u  MHLEN\n", __func__, MHLEN);
+    dprint("%s: %4u  MLEN\n", __func__, MLEN);
 
     dprint("tdmin %u, tdmax %u, refcnt %d\n", tdmin, tdmax, tdp->refcnt);
 
     /* Consider adjusting the xx_tdp_workq padding if you see this message.
      */
-    if ((sizeof(struct xx_tdp_workq) & 1) == 0)
+    if (((sizeof(struct xx_tdp_workq) / CACHE_LINE_SIZE) & 1) == 0)
         dprint("struct xx_tdp_workq is an even number of cache lines\n");
 
     free(cgv, M_XX_TDP);

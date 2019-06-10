@@ -60,8 +60,6 @@
 #include <rpcsvc/nfs_prot.h>
 
 #ifdef __FreeBSD__
-//#define USE_TSC
-
 #include <sys/sysctl.h>
 #endif
 
@@ -133,6 +131,8 @@ static clp_option_t optionv[] = {
 };
 
 #ifdef USE_TSC
+#define rdtsc()     __builtin_ia32_rdtsd()
+#if 0
 static inline uint64_t
 rdtsc(void)
 {
@@ -142,6 +142,7 @@ rdtsc(void)
 
     return (low | ((u_int64_t)high << 32));
 }
+#endif
 #endif
 
 int
@@ -313,6 +314,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
             }
 
             rpc_rm_get(rxbuf, &rmlen, &last);
+            assert(rmlen < 1024);
 
             rxmax = rmlen + RPC_RM_SZ;
             rxoff = RPC_RM_SZ;
@@ -357,6 +359,8 @@ nullproc_async(int fd, struct tdargs *tdargs)
                 assert(rxmax - rmlen - rxoff == RPC_RM_SZ);
 
                 rpc_rm_get(rxbuf + rmlen + rxoff, &rmlen2, &last2);
+                assert(rmlen < 1024);
+
                 if (rmlen2 == 0) {
                     eprint("invalid record mark: %ld %u %u %u %u %lu %lu\n",
                            rxlen, rxmax, rmlen, rxoff, rmlen2, msgrx, msgtx);
@@ -442,7 +446,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
         bool last;
         XDR xdr;
 
-        rpclen = rpc_encode(msgcnt + 1, NFS3_NULL, auth, txbuf, msgmax);
+        rpclen = rpc_encode(msgrx, NFS3_NULL, auth, txbuf, msgmax);
         if (rpclen == -1) {
             eprint("rpc_encode: len %d, msgrx %ld\n", rpclen, msgrx);
             abort();

@@ -84,16 +84,13 @@ xx_conn_hold(struct xx_conn *conn)
     return atomic_fetchadd_int(&conn->refcnt, 1) + 1;
 }
 
-void
-xx_conn_rele(struct xx_conn *conn)
+static void
+xx_conn_destroy(struct xx_conn *conn)
 {
     struct xx_svc *svc = conn->svc;
 
     KASSERT(conn->magic == conn, "invalid conn magic");
-    KASSERT(conn->refcnt > 0, "invalid conn refcnt");
-
-    if (atomic_fetchadd_int(&conn->refcnt, -1) > 1)
-        return;
+    KASSERT(conn->refcnt == 0, "invalid conn refcnt");
 
     mtx_lock(&svc->mtx);
     TAILQ_REMOVE(&svc->connq, conn, connq_entry);
@@ -115,6 +112,25 @@ xx_conn_rele(struct xx_conn *conn)
     mtx_unlock(&svc->mtx);
 }
 
+void
+xx_conn_reln(struct xx_conn *conn, int n)
+{
+    KASSERT(conn->magic == conn, "invalid conn magic");
+    KASSERT(conn->refcnt > 0, "invalid conn refcnt zero");
+    KASSERT(conn->refcnt >= n, "invalid conn refcnt");
+
+    if (atomic_fetchadd_int(&conn->refcnt, -n) > n)
+        return;
+
+    xx_conn_destroy(conn);
+}
+
+void
+xx_conn_rele(struct xx_conn *conn)
+{
+    xx_conn_reln(conn, 1);
+}
+
 static struct xx_conn *
 xx_conn_create(struct xx_svc *svc, struct socket *so,
                xx_tdp_work_cb_t *workcb, xx_conn_cb_t *recv_cb,
@@ -123,7 +139,7 @@ xx_conn_create(struct xx_svc *svc, struct socket *so,
     struct xx_conn *conn;
     size_t sz;
 
-    sz = sizeof(*conn) + privsz;
+    sz = sizeof(*conn) + roundup(privsz, __alignof(*conn));
 
     conn = malloc(sz, M_XX_CONN, M_ZERO | M_WAITOK);
     if (conn) {
@@ -145,6 +161,9 @@ xx_conn_create(struct xx_svc *svc, struct socket *so,
         mtx_unlock(&svc->mtx);
     }
 
+    if ((uintptr_t)conn % __alignof(*conn))
+        dprint("conn %p not %zu-byte aligned\n", conn, __alignof(*conn));
+
     return conn;
 }
 
@@ -162,7 +181,8 @@ xx_rcv_soupcall(struct socket *so, void *arg, int wait)
     soupcall_clear(so, SO_RCV);
 
     xx_conn_hold(conn);
-    ++conn->nsoupcalls;
+
+    //++conn->nsoupcalls;
 
     xx_tdp_enqueue(&conn->work, curcpu);
 
@@ -174,7 +194,7 @@ xx_rcv_receive(struct xx_tdp_work *work)
 {
     struct xx_conn *conn = work->argv[0];
 
-    ++conn->ncallbacks;
+    //++conn->ncallbacks;
 
     conn->recv_cb(conn);
 

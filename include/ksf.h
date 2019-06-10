@@ -33,7 +33,10 @@
 static inline void
 rpc_rm_get(const void *ptr, uint32_t *msglenp, bool *lastp)
 {
-    uint32_t mark = ntohl( *(const uint32_t *)ptr );
+    uint32_t mark;
+
+    memcpy(&mark, ptr, sizeof(mark));
+    mark = ntohl(mark);
 
     *msglenp = mark & ~0x80000000u;
     *lastp = mark & 0x80000000u;
@@ -47,15 +50,24 @@ rpc_rm_set(void *ptr, uint32_t msglen, bool last)
     if (last)
         mark |= 0x80000000u;
 
-    *(uint32_t *)ptr = htonl(mark);
+    mark = htonl(mark);
+    memcpy(ptr, &mark, sizeof(mark));
 }
 
 #ifndef ntohll
-#define ntohll(_x)  be64toh(_x)
+#define ntohll(_x)      be64toh((_x))
 #endif
 
 #ifndef htonll
-#define htonll(_x)  htobe64(_x)
+#define htonll(_x)      htobe64((_x))
+#endif
+
+#ifndef likely
+#define likely(_x)      __builtin_expect(!!(_x), 1)
+#endif
+
+#ifndef unlikely
+#define unlikely(_x)    __builtin_expect(!!(_x), 0)
 #endif
 
 

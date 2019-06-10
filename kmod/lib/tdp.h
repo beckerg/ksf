@@ -36,7 +36,7 @@ struct xx_tdp_work {
 
     struct xx_tdp      *tdp;
     xx_tdp_work_cb_t   *func;
-    void               *argv[4];
+    void               *argv[2];
 };
 
 void xx_tdp_enqueue(struct xx_tdp_work *work, int cpu);

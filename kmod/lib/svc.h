@@ -30,21 +30,22 @@ struct xx_conn;
 typedef void xx_conn_cb_t(struct xx_conn *);
 
 struct xx_conn {
-    struct xx_tdp_work      work;
-    u_long                  nsoupcalls;
-    u_long                  ncallbacks;
     int                     refcnt;
     bool                    active;
-    size_t                  privsz;
-    void                   *magic;
+    struct xx_tdp_work      work;
 
-    struct xx_svc          *svc;
     xx_conn_cb_t           *recv_cb;
-    xx_conn_cb_t           *destroy_cb;
-
     struct socket          *so;
+    struct xx_svc          *svc;
+
+    xx_conn_cb_t           *destroy_cb;
     struct sockaddr        *laddr;
     TAILQ_ENTRY(xx_conn)    connq_entry;
+
+    u_long                  nsoupcalls;
+    u_long                  ncallbacks;
+    size_t                  privsz;
+    void                   *magic;
 
     __aligned(CACHE_LINE_SIZE)
     char                    priv[];
@@ -58,6 +59,7 @@ xx_conn_priv(struct xx_conn *conn)
 
 int xx_conn_hold(struct xx_conn *conn);
 void xx_conn_rele(struct xx_conn *conn);
+void xx_conn_reln(struct xx_conn *conn, int n);
 
 int xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port,
                   xx_conn_cb_t *accept_cb, xx_conn_cb_t *recv_cb,

@@ -76,97 +76,163 @@ SYSCTL_UINT(_kern_krpc2, OID_AUTO, port,
             &xx_port, 0,
             "Set listening port");
 
-struct conn_priv {
-    struct mbuf    *frag;
-    struct mbuf    *last;
-    struct mbuf    *msg;
-    struct mbuf    *hdr;
-    int     rcvlowat;
-    u_long  nrcvlowat;
-    u_long  nmisaligned;
-    u_long  pad;
+struct clreq;
+STAILQ_HEAD(clhead, clreq);
 
-    struct mtx                  txq_mtx;
-    STAILQ_HEAD(, xx_tdp_work)  txq_head;
-    bool                        txq_active;
+/* A client request object is allocated for each RPC call message we pull
+ * off the wire.  It is used to provide space for decoding the message
+ * and sheparding the request through the system.  Note that it retains
+ * most of the intermediate results so that they are available at all
+ * stages of request processing.
+ */
+struct clreq {
+    struct xx_tdp_work  work;
+
+    STAILQ_ENTRY(clreq) clentry;
+    struct mbuf        *mreply;
+    struct mbuf        *mcall;
+
+    XDR                 rxdr;
+    struct rpc_msg      rmsg;
+
+    XDR                 cxdr;
+    struct rpc_msg      cmsg;
 
     char credbuf[MAX_AUTH_BYTES];
     char verfbuf[MAX_AUTH_BYTES];
 };
 
+/* A connection private object is created for each new client
+ * connection.  It is used to accumulate RPC message fragments
+ * between calls to soreceive() and to provide a per-connection
+ * send queue which serializes outgoing reply messages.
+ */
+struct conn_priv {
+    struct mbuf    *frag;
+    struct mbuf    *last;
+    struct mbuf    *mcall;
+    struct clreq   *req;
+
+    int     rcvlowat;
+    u_long  nrcvlowat;
+    u_long  nmisaligned;
+    u_long  pad;
+
+    struct mtx      txq_mtx;
+    struct clhead   txq_head;
+    bool            txq_active;
+
+};
+
+static struct xx_svc *krpc2_svc;
+static uma_zone_t clzone;
+
 static void
 krpc_send(struct xx_tdp_work *work)
 {
+    struct clhead todo, done;
     struct conn_priv *priv;
+    struct clreq *req, *tmp;
     struct xx_conn *conn;
-    int sndpercall = 128;
-    struct mbuf *h;
-    int errs = 0;
+    struct mbuf *mreply;
+    int sndpercb = 16;
+    int refs = 0;
     int rc;
 
-  again:
+    STAILQ_INIT(&done);
+    STAILQ_INIT(&todo);
+
     conn = work->argv[0];
+    work = NULL;
+
     priv = xx_conn_priv(conn);
 
-    h = work->argv[1];
-    m_fixhdr(h);
+    mtx_lock(&priv->txq_mtx);
+    STAILQ_CONCAT(&todo, &priv->txq_head);
+    mtx_unlock(&priv->txq_mtx);
 
-    rpc_rm_set(mtod(h, void *), h->m_pkthdr.len, true);
-    h->m_len += RPC_RM_SZ;
+  again:
+    mreply = NULL;
 
-    rc = sosend(conn->so, NULL, NULL, h, NULL, 0, curthread);
+    while (( req = STAILQ_FIRST(&todo) )) {
+        STAILQ_REMOVE_HEAD(&todo, clentry);
+        STAILQ_INSERT_TAIL(&done, req, clentry);
 
-    if (rc && (errs++ % 8) == 0) {
+        if (mreply)
+            m_catpkt(mreply, req->mreply);
+        else
+            mreply = req->mreply;
+
+        req->mreply = NULL;
+
+        /* TODO: Restrict mreply length to available send buffer
+         * size so as to mitigate blocking in sosend().
+         */
+        if (mreply->m_pkthdr.len > 768)
+            break;
+    }
+
+    rc = sosend(conn->so, NULL, NULL, mreply, NULL, 0, curthread);
+    if (rc) {
         dprint("sosend: conn %p, rc %d, %lu %lu, %lu %lu\n",
                conn, rc, conn->nsoupcalls, conn->ncallbacks,
                priv->nrcvlowat, priv->nmisaligned);
+        sndpercb = 0;
     }
+
+    if (STAILQ_FIRST(&todo) && --sndpercb > 0)
+        goto again;
 
     mtx_lock(&priv->txq_mtx);
-    work = STAILQ_FIRST(&priv->txq_head);
-    if (work)
-        STAILQ_REMOVE_HEAD(&priv->txq_head, wqe);
-    priv->txq_active = !!work;
+    STAILQ_CONCAT(&todo, &priv->txq_head);
+    STAILQ_CONCAT(&priv->txq_head, &todo);
+    if (rc)
+        STAILQ_CONCAT(&done, &priv->txq_head);
+    req = STAILQ_FIRST(&priv->txq_head);
+    priv->txq_active = !!req;
     mtx_unlock(&priv->txq_mtx);
 
-    xx_conn_rele(conn);
-
-    if (work) {
-        if (--sndpercall > 0)
-            goto again;
-
-        work->func = krpc_send;
-        xx_tdp_enqueue(work, curcpu);
+    if (req) {
+        req->work.func = krpc_send;
+        xx_tdp_enqueue(&req->work, curcpu);
     }
+
+    STAILQ_FOREACH_SAFE(req, &done, clentry, tmp) {
+        uma_zfree(clzone, req);
+        ++refs;
+    }
+
+    xx_conn_reln(conn, refs);
 }
 
 static void
 krpc_recv_rpc(struct xx_tdp_work *work)
 {
-    struct xx_conn *conn = work->argv[0];
     enum accept_stat ar_stat;
     struct conn_priv *priv;
-    struct rpc_msg msg;
-    struct mbuf *h, *m;
-    XDR xdr;
+    struct xx_conn *conn;
+    struct rpc_msg *msg;
+    struct clreq *req;
+    struct mbuf *h;
+    uint32_t mark;
 
+    conn = work->argv[0];
+    req = work->argv[1];
     priv = xx_conn_priv(conn);
-    h = work->argv[1];
-    m = h->m_next;
 
     /* Decode the incoming RPC call message...
      */
-    msg.ru.RM_cmb.cb_cred.oa_base = priv->credbuf;
-    msg.ru.RM_cmb.cb_verf.oa_base = priv->verfbuf;
+    msg = &req->cmsg;
+    msg->ru.RM_cmb.cb_cred.oa_base = req->credbuf;
+    msg->ru.RM_cmb.cb_verf.oa_base = req->verfbuf;
 
-    xdrmbuf_create(&xdr, m, XDR_DECODE);
+    xdrmbuf_create(&req->cxdr, req->mcall, XDR_DECODE);
 
-    if (!xdr_callmsg(&xdr, &msg)) {
-        eprint("%s: xdr_callmsg failed: m_len %d, xid %u\n",
-               __func__, m_length(m, NULL), msg.rm_xid);
+    if (!xdr_callmsg(&req->cxdr, msg)) {
+        eprint("%s: xdr_callmsg failed: xid %u, len %u\n",
+               __func__, msg->rm_xid, m_length(req->mcall, NULL));
+        uma_zfree(clzone, req);
         xx_conn_rele(conn);
-        xdr_destroy(&xdr);
-        m_free(h);
         return;
     }
 
@@ -174,7 +240,7 @@ krpc_recv_rpc(struct xx_tdp_work *work)
      * same semantics and never require any kind of authentication.
      * https://tools.ietf.org/html/rfc5531, Section 12.1
      */
-    switch (msg.rm_call.cb_proc) {
+    switch (msg->rm_call.cb_proc) {
     case 0:
         ar_stat = SUCCESS;
         break;
@@ -184,39 +250,63 @@ krpc_recv_rpc(struct xx_tdp_work *work)
         break;
     }
 
-    m_freem(m->m_next);
-    m_init(m, M_WAITOK, m->m_type, m->m_flags);
-
     /* Encode the outgoing RPC reply message...
      */
-    msg.rm_direction = REPLY;
-    msg.rm_reply.rp_stat = MSG_ACCEPTED;
+    msg = &req->rmsg;
+    msg->rm_direction = REPLY;
+    msg->rm_reply.rp_stat = MSG_ACCEPTED;
 
-    msg.acpted_rply.ar_verf = _null_auth;
-    msg.acpted_rply.ar_stat = ar_stat;
-    msg.acpted_rply.ar_results.where = NULL;
-    msg.acpted_rply.ar_results.proc = (xdrproc_t)xdr_void;
+    msg->acpted_rply.ar_verf = _null_auth;
+    msg->acpted_rply.ar_stat = ar_stat;
+    msg->acpted_rply.ar_results.where = NULL;
+    msg->acpted_rply.ar_results.proc = (xdrproc_t)xdr_void;
 
-    xdrmbuf_create(&xdr, m, XDR_ENCODE);
+    h = m_gethdr(M_WAITOK, MT_DATA);
+    m_align(h, 64);
 
-    if (!xdr_replymsg(&xdr, &msg)) {
-        eprint("%s: xdr_replymsg failed: xid %u\n", __func__, msg.rm_xid);
+    xdrmbuf_create(&req->rxdr, h, XDR_ENCODE);
+
+    /* Reserve space for the RPC record mark.
+     */
+    mark = 0xdeadbeef;
+    xdr_uint32_t(&req->rxdr, &mark);
+
+    if (!xdr_replymsg(&req->rxdr, msg)) {
+        eprint("%s: xdr_replymsg failed: xid %u\n", __func__, msg->rm_xid);
+        uma_zfree(clzone, req);
         xx_conn_rele(conn);
         m_freem(h);
         return;
     }
 
-    mtx_lock(&priv->txq_mtx);
-    if (priv->txq_active) {
-        STAILQ_INSERT_TAIL(&priv->txq_head, work, wqe);
-        work = NULL;
+    /* Ensure the RPC record mark is in contiguous memory (this should
+     * always be the case).
+     */
+    if (unlikely( h->m_len < RPC_RM_SZ )) {
+        h = m_pullup(h, RPC_RM_SZ);
+        if (!h) {
+            eprint("%s: m_pullup mark failed: xid %u\n", __func__, msg->rm_xid);
+            uma_zfree(clzone, req);
+            xx_conn_rele(conn);
+            return;
+        }
     }
+
+    m_fixhdr(h);
+
+    rpc_rm_set(mtod(h, void *), h->m_pkthdr.len - RPC_RM_SZ, true);
+    req->mreply = h;
+
+    mtx_lock(&priv->txq_mtx);
+    STAILQ_INSERT_TAIL(&priv->txq_head, req, clentry);
+    if (priv->txq_active)
+        req = NULL;
     priv->txq_active = true;
     mtx_unlock(&priv->txq_mtx);
 
-    if (work) {
-        work->func = krpc_send;
-        xx_tdp_enqueue(work, curcpu);
+    if (req) {
+        req->work.func = krpc_send;
+        xx_tdp_enqueue(&req->work, curcpu);
     }
 }
 
@@ -301,29 +391,29 @@ krpc_recv_tcp(struct xx_conn *conn)
 
     /* Accumulate RPC records until we see the last record.
      */
-    if (priv->msg) {
-        m_cat(priv->msg, m);
+    if (priv->mcall) {
+        m_cat(priv->mcall, m);
     } else {
-        priv->msg = m;
+        priv->mcall = m;
     }
 
     if (reclast) {
         struct xx_tdp_work *work;
-        struct mbuf *h;
+        struct clreq *req;
 
-        h = priv->hdr;
-        if (!h)
-            h = m_gethdr(M_WAITOK, MT_DATA);
+        req = priv->req;
+        if (!req)
+            req = uma_zalloc(clzone, M_WAITOK);
 
-        h->m_next = priv->msg;
-        priv->msg = NULL;
+        req->mcall = priv->mcall;
+        priv->mcall = NULL;
 
         xx_conn_hold(conn);
 
-        work = mtod(h, struct xx_tdp_work *);
+        work = &req->work;
         work->tdp = conn->work.tdp;
         work->argv[0] = conn;
-        work->argv[1] = h;
+        work->argv[1] = req;
         work->func = krpc_recv_rpc;
 
         if (priv->frag)
@@ -331,7 +421,7 @@ krpc_recv_tcp(struct xx_conn *conn)
         else
             work->func(work);
 
-        priv->hdr = m_gethdr(M_NOWAIT, MT_DATA);
+        priv->req = uma_zalloc(clzone, M_NOWAIT);
     }
 
     if (priv->frag)
@@ -356,7 +446,7 @@ krpc_accept_cb(struct xx_conn *conn)
     mtx_init(&priv->txq_mtx, "rpcmtx", NULL, MTX_DEF);
     STAILQ_INIT(&priv->txq_head);
     priv->rcvlowat = RPC_RM_SZ;
-    priv->hdr = m_gethdr(M_NOWAIT, MT_DATA);
+    priv->req = uma_zalloc(clzone, M_NOWAIT);
 
     xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
 }
@@ -373,13 +463,27 @@ krpc_destroy_cb(struct xx_conn *conn)
     KASSERT(priv->inited, "priv not initialized");
 
     m_freem(priv->frag);
-    m_freem(priv->msg);
-    m_freem(priv->hdr);
+    m_freem(priv->mcall);
+    uma_zfree(clzone, priv->req);
 
     mtx_destroy(&priv->txq_mtx);
 }
 
-static struct xx_svc *krpc2_svc;
+static void
+krpc_clzone_dtor(void *mem, int size, void *arg)
+{
+    struct clreq *req = mem;
+
+    if (req->mcall) {
+        m_freem(req->mcall);
+        req->mcall = NULL;
+    }
+
+    if (req->mreply) {
+        m_freem(req->mreply);
+        req->mreply = NULL;
+    }
+}
 
 int
 krpc2_mod_load(module_t mod, int cmd, void *data)
@@ -388,9 +492,20 @@ krpc2_mod_load(module_t mod, int cmd, void *data)
     struct xx_svc *svc;
     int rc;
 
+    clzone = uma_zcreate(KSF_MOD_NAME "_clzone",
+                         sizeof(struct clreq),
+                         NULL, krpc_clzone_dtor, NULL, NULL,
+                         CACHE_LINE_SIZE, UMA_ZONE_ZINIT);
+    if (!clzone)
+        return ENOMEM;
+
+    /* TODO: Provide an alternate way to start/stop services
+     * so that we can avoid doing it in module load/unload.
+     */
     rc = xx_svc_create(&svc);
     if (rc) {
         eprint("xx_svc_create() failed: %d\n", rc);
+        uma_zdestroy(clzone);
         return rc;
     }
 
@@ -400,6 +515,7 @@ krpc2_mod_load(module_t mod, int cmd, void *data)
     if (rc) {
         eprint("xx_svc_listen() failed: %d\n", rc);
         xx_svc_shutdown(svc);
+        uma_zdestroy(clzone);
         return rc;
     }
 
@@ -417,8 +533,11 @@ krpc2_mod_unload(module_t mod, int cmd, void *data)
 
     dprint("%s: rc %d\n", __func__, rc);
 
-    if (!rc)
+    if (!rc) {
         krpc2_svc = NULL;
+        uma_zdestroy(clzone);
+        clzone = NULL;
+    }
 
     return rc;
 }
