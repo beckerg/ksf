@@ -32,20 +32,18 @@ typedef void xx_conn_cb_t(struct xx_conn *);
 struct xx_conn {
     int                     refcnt;
     bool                    active;
-    struct xx_tdp_work      work;
-
-    xx_conn_cb_t           *recv_cb;
-    struct socket          *so;
-    struct xx_svc          *svc;
-
-    xx_conn_cb_t           *destroy_cb;
+    xx_conn_cb_t           *destroy;
     struct sockaddr        *laddr;
-    TAILQ_ENTRY(xx_conn)    connq_entry;
-
-    u_long                  nsoupcalls;
-    u_long                  ncallbacks;
     size_t                  privsz;
+    TAILQ_ENTRY(xx_conn)    connq_entry;
     void                   *magic;
+
+    __aligned(CACHE_LINE_SIZE)
+    struct tpreq            tpreq;
+    struct tpool           *tpool;
+    struct socket          *so;
+    xx_conn_cb_t           *recv;
+    struct xx_svc          *svc;
 
     __aligned(CACHE_LINE_SIZE)
     char                    priv[];

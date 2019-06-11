@@ -23,26 +23,31 @@
  * SUCH DAMAGE.
  */
 
-#ifndef XX_TDP_H
-#define XX_TDP_H
+#ifndef TPOOL_H
+#define TPOOL_H
 
-struct xx_tdp;
-struct xx_tdp_work;
+struct tpool;
+struct tpreq;
 
-typedef void xx_tdp_work_cb_t(struct xx_tdp_work *);
+typedef void tpool_cb_t(struct tpreq *);
 
-struct xx_tdp_work {
-    STAILQ_ENTRY(xx_tdp_work)    wqe;
-
-    struct xx_tdp      *tdp;
-    xx_tdp_work_cb_t   *func;
-    void               *argv[2];
+struct tpreq {
+    STAILQ_ENTRY(tpreq) entry;
+    tpool_cb_t         *func;
+    void               *arg;
 };
 
-void xx_tdp_enqueue(struct xx_tdp_work *work, int cpu);
+static inline void
+tpreq_init(struct tpreq *req, tpool_cb_t *func, void *arg)
+{
+    req->func = func;
+    req->arg = arg;
+}
 
-struct xx_tdp *xx_tdp_create(u_int tdmin, u_int tdmax);
-void xx_tdp_shutdown(struct xx_tdp *tdp);
-void xx_tdp_rele(struct xx_tdp *tdp);
+void tpool_enqueue(struct tpool *tpool, struct tpreq *req, int cpu);
 
-#endif /* XX_TDP_H */
+struct tpool *tpool_create(u_int tdmin, u_int tdmax);
+void tpool_shutdown(struct tpool *tpool);
+void tpool_rele(struct tpool *tpool);
+
+#endif /* TPOOL_H */

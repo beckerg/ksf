@@ -86,7 +86,7 @@ STAILQ_HEAD(clhead, clreq);
  * stages of request processing.
  */
 struct clreq {
-    struct xx_tdp_work  work;
+    struct tpreq        tpreq;
 
     STAILQ_ENTRY(clreq) clentry;
     struct mbuf        *mreply;
@@ -111,7 +111,7 @@ struct conn_priv {
     struct mbuf    *frag;
     struct mbuf    *last;
     struct mbuf    *mcall;
-    struct clreq   *req;
+    struct clreq   *clreq;
 
     int     rcvlowat;
     u_long  nrcvlowat;
@@ -128,7 +128,7 @@ static struct xx_svc *krpc2_svc;
 static uma_zone_t clzone;
 
 static void
-krpc_send(struct xx_tdp_work *work)
+krpc_send(struct tpreq *tpreq)
 {
     struct clhead todo, done;
     struct conn_priv *priv;
@@ -142,8 +142,8 @@ krpc_send(struct xx_tdp_work *work)
     STAILQ_INIT(&done);
     STAILQ_INIT(&todo);
 
-    conn = work->argv[0];
-    work = NULL;
+    conn = tpreq->arg;
+    tpreq = NULL;
 
     priv = xx_conn_priv(conn);
 
@@ -174,9 +174,8 @@ krpc_send(struct xx_tdp_work *work)
 
     rc = sosend(conn->so, NULL, NULL, mreply, NULL, 0, curthread);
     if (rc) {
-        dprint("sosend: conn %p, rc %d, %lu %lu, %lu %lu\n",
-               conn, rc, conn->nsoupcalls, conn->ncallbacks,
-               priv->nrcvlowat, priv->nmisaligned);
+        dprint("sosend: conn %p, rc %d, %lu %lu\n",
+               conn, rc, priv->nrcvlowat, priv->nmisaligned);
         sndpercb = 0;
     }
 
@@ -193,8 +192,8 @@ krpc_send(struct xx_tdp_work *work)
     mtx_unlock(&priv->txq_mtx);
 
     if (req) {
-        req->work.func = krpc_send;
-        xx_tdp_enqueue(&req->work, curcpu);
+        req->tpreq.func = krpc_send;
+        tpool_enqueue(conn->tpool, &req->tpreq, curcpu);
     }
 
     STAILQ_FOREACH_SAFE(req, &done, clentry, tmp) {
@@ -206,7 +205,7 @@ krpc_send(struct xx_tdp_work *work)
 }
 
 static void
-krpc_recv_rpc(struct xx_tdp_work *work)
+krpc_recv_rpc(struct tpreq *tpreq)
 {
     enum accept_stat ar_stat;
     struct conn_priv *priv;
@@ -216,8 +215,8 @@ krpc_recv_rpc(struct xx_tdp_work *work)
     struct mbuf *h;
     uint32_t mark;
 
-    conn = work->argv[0];
-    req = work->argv[1];
+    req = container_of(tpreq, struct clreq, tpreq);
+    conn = tpreq->arg;
     priv = xx_conn_priv(conn);
 
     /* Decode the incoming RPC call message...
@@ -305,8 +304,8 @@ krpc_recv_rpc(struct xx_tdp_work *work)
     mtx_unlock(&priv->txq_mtx);
 
     if (req) {
-        req->work.func = krpc_send;
-        xx_tdp_enqueue(&req->work, curcpu);
+        req->tpreq.func = krpc_send;
+        tpool_enqueue(conn->tpool, &req->tpreq, curcpu);
     }
 }
 
@@ -338,9 +337,8 @@ krpc_recv_tcp(struct xx_conn *conn)
     if (rc || !m) {
         if (rc != EWOULDBLOCK) {
             if (rc) {
-                dprint("soreceive: conn %p, rc %d, m %p, flags %x, %lu %lu, %lu %lu\n",
-                       conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks,
-                       priv->nrcvlowat, priv->nmisaligned);
+                dprint("soreceive: conn %p, rc %d, m %p, flags %x, %lu %lu\n",
+                       conn, rc, m, flags, priv->nrcvlowat, priv->nmisaligned);
             }
 
             conn->active = false;
@@ -398,30 +396,27 @@ krpc_recv_tcp(struct xx_conn *conn)
     }
 
     if (reclast) {
-        struct xx_tdp_work *work;
-        struct clreq *req;
+        struct tpreq *tpreq;
+        struct clreq *clreq;
 
-        req = priv->req;
-        if (!req)
-            req = uma_zalloc(clzone, M_WAITOK);
+        clreq = priv->clreq;
+        if (!clreq)
+            clreq = uma_zalloc(clzone, M_WAITOK);
 
-        req->mcall = priv->mcall;
+        clreq->mcall = priv->mcall;
         priv->mcall = NULL;
 
         xx_conn_hold(conn);
 
-        work = &req->work;
-        work->tdp = conn->work.tdp;
-        work->argv[0] = conn;
-        work->argv[1] = req;
-        work->func = krpc_recv_rpc;
+        tpreq = &clreq->tpreq;
+        tpreq_init(tpreq, krpc_recv_rpc, conn);
 
         if (priv->frag)
-            xx_tdp_enqueue(work, curcpu);
+            tpool_enqueue(conn->tpool, tpreq, curcpu);
         else
-            work->func(work);
+            tpreq->func(tpreq);
 
-        priv->req = uma_zalloc(clzone, M_NOWAIT);
+        priv->clreq = uma_zalloc(clzone, M_NOWAIT);
     }
 
     if (priv->frag)
@@ -446,7 +441,7 @@ krpc_accept_cb(struct xx_conn *conn)
     mtx_init(&priv->txq_mtx, "rpcmtx", NULL, MTX_DEF);
     STAILQ_INIT(&priv->txq_head);
     priv->rcvlowat = RPC_RM_SZ;
-    priv->req = uma_zalloc(clzone, M_NOWAIT);
+    priv->clreq = uma_zalloc(clzone, M_NOWAIT);
 
     xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
 }
@@ -462,9 +457,9 @@ krpc_destroy_cb(struct xx_conn *conn)
 
     KASSERT(priv->inited, "priv not initialized");
 
+    uma_zfree(clzone, priv->clreq);
     m_freem(priv->frag);
     m_freem(priv->mcall);
-    uma_zfree(clzone, priv->req);
 
     mtx_destroy(&priv->txq_mtx);
 }

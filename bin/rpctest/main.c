@@ -70,6 +70,8 @@
 #define MSGLAG_MAX  (1024)
 #define NFS3_NULL   (0)
 
+#define rdtsc()     __builtin_ia32_rdtsd()
+
 char version[] = PROG_VERSION;
 char *progname;
 int verbosity;
@@ -129,21 +131,6 @@ static clp_option_t optionv[] = {
 
     CLP_OPTION_END
 };
-
-#ifdef USE_TSC
-#define rdtsc()     __builtin_ia32_rdtsd()
-#if 0
-static inline uint64_t
-rdtsc(void)
-{
-    uint32_t low, high;
-
-    __asm __volatile("rdtsc" : "=a" (low), "=d" (high));
-
-    return (low | ((u_int64_t)high << 32));
-}
-#endif
-#endif
 
 int
 rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, char *buf, size_t bufsz)

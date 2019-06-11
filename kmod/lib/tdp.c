@@ -53,9 +53,9 @@
 #include "xx.h"
 #include "tdp.h"
 
-MALLOC_DEFINE(M_XX_TDP, "xx_tdp", "xx thread pool");
+MALLOC_DEFINE(M_TPOOL, "tpool", "thread pool");
 
-struct xx_tdargs {
+struct tdargs {
     void      (*func)(void *arg);
     void       *argv[4];
     char        name[15];
@@ -63,63 +63,66 @@ struct xx_tdargs {
     cpuset_t    cpuset;
 };
 
+STAILQ_HEAD(twhead, tpreq);
+
 /* A thread group manages a work queue and zero or more threads
- * that are affined to one core (except that maintence thread
+ * that are affined to one core (except the maintenance thread
  * group whose threads can run on any vCPU).
  */
-struct xx_tdp_workq {
-    struct mtx                  mtx;
-    STAILQ_HEAD(, xx_tdp_work)  head;
-    bool                        running;
-    bool                        growing;
-    u_int                       tdsleeping;
-    u_int                       tdcnt;
-    u_int                       tdmax;
-    u_int                       tdmin;
-    u_int                       spare;
+struct tgroup {
+    struct mtx          mtx;
+    struct twhead       head;
+    bool                running;
+    bool                growing;
+    u_int               tdsleeping;
+    u_int               tdcnt;
+    u_int               tdmax;
+    u_int               tdmin;
+    u_int               spare;
 
-    u_long                      callbacks;
-    u_long                      grows;
-    struct cv                   cv;
-    struct xx_tdp_work          grow;
+    u_long              callbacks;
+    u_long              grows;
+    struct cv           cv;
+    struct tpreq        grow;
 
-    struct xx_tdargs            tdargs;
+    struct tpool       *tpool;
+    struct tdargs       tdargs;
 
     /* Add extra padding so that the size is an odd number
      * of cache lines.
      */
-    char                        pad[CACHE_LINE_SIZE];
+    char                pad[CACHE_LINE_SIZE];
 } __aligned(CACHE_LINE_SIZE);
 
 
-struct xx_tdp {
+struct tpool {
 #if MAXCPU > 256
-    uint16_t                cpu2workq[MAXCPU];
+    uint16_t            cpu2tgroup[MAXCPU];
 #else
-    uint8_t                 cpu2workq[MAXCPU];
+    uint8_t             cpu2tgroup[MAXCPU];
 #endif
-    int                     refcnt;
-    int                     cgmax;
-    size_t                  allocsz;
-    void                   *magic;
+    int                 refcnt;
+    int                 cgmax;
+    size_t              allocsz;
+    void               *magic;
 
-    struct xx_tdp_workq     workqv[];
+    struct tgroup       tgroupv[];
 };
 
-static cpuset_t xx_tdp_cpuset;
+static cpuset_t tpool_cpuset;
 
-static __always_inline struct xx_tdp_workq *
-xx_tdp_cpu2workq(struct xx_tdp *tdp, int cpu)
+static inline struct tgroup *
+tpool_cpu2tgroup(struct tpool *tpool, int cpu)
 {
-    uint8_t idx = tdp->cpu2workq[cpu % MAXCPU];
+    uint8_t idx = tpool->cpu2tgroup[cpu % MAXCPU];
 
-    return tdp->workqv + idx;
+    return tpool->tgroupv + idx;
 }
 
 /* Create and start a kernel thread.
  */
 static int
-xx_tdp_kthread_create(struct xx_tdargs *tdargs)
+tpool_kthread_create(struct tdargs *tdargs)
 {
     struct thread *td;
     int rc;
@@ -146,171 +149,169 @@ xx_tdp_kthread_create(struct xx_tdargs *tdargs)
 }
 
 static int
-xx_tdp_hold(struct xx_tdp *tdp)
+tpool_hold(struct tpool *tpool)
 {
-    KASSERT(tdp->magic == tdp, "invalid tdp magic");
-    KASSERT(tdp->refcnt > 0, "invalid tdp refcnt");
+    KASSERT(tpool->magic == tpool, "invalid tpool magic");
+    KASSERT(tpool->refcnt > 0, "invalid tpool refcnt");
 
-    return atomic_fetchadd_int(&tdp->refcnt, 1) + 1;
+    return atomic_fetchadd_int(&tpool->refcnt, 1) + 1;
 }
 
 void
-xx_tdp_rele(struct xx_tdp *tdp)
+tpool_rele(struct tpool *tpool)
 {
     int i;
 
-    KASSERT(tdp->magic == tdp, "invalid tdp magic");
-    KASSERT(tdp->refcnt > 0, "invalid tdp refcnt");
+    KASSERT(tpool->magic == tpool, "invalid tpool magic");
+    KASSERT(tpool->refcnt > 0, "invalid tpool refcnt");
 
-    if (atomic_fetchadd_int(&tdp->refcnt, -1) > 1)
+    if (atomic_fetchadd_int(&tpool->refcnt, -1) > 1)
         return;
 
     /* Give kthreads a brief opportunity to finish exiting.
      * Is there a way to to this synchronously???
      */
-    tsleep(tdp, 0, "tdpwait", 1);
+    tsleep(tpool, 0, "tpwait", 1);
 
-    for (i = 0; i < tdp->cgmax + 1; ++i) {
-        mtx_destroy(&tdp->workqv[i].mtx);
-        cv_destroy(&tdp->workqv[i].cv);
+    for (i = 0; i < tpool->cgmax + 1; ++i) {
+        mtx_destroy(&tpool->tgroupv[i].mtx);
+        cv_destroy(&tpool->tgroupv[i].cv);
     }
 
-    tdp->magic = NULL;
-    contigfree(tdp, tdp->allocsz, M_XX_TDP);
+    tpool->magic = NULL;
+    contigfree(tpool, tpool->allocsz, M_TPOOL);
 }
 
 static void
-xx_tdp_grow(struct xx_tdp_work *work)
+tpool_grow(struct tpreq *req)
 {
-    struct xx_tdp_workq *workq = work->argv[0];
+    struct tgroup *tgroup = container_of(req, struct tgroup, grow);
     int rc;
 
-    KASSERT(work && !work->tdp || !work->func, "invalid work");
+    KASSERT(req && tgroup && ttpool, "invalid thread pool request");
 
-    rc = xx_tdp_kthread_create(&workq->tdargs);
+    rc = tpool_kthread_create(&tgroup->tdargs);
     if (rc)
-        xx_tdp_rele(work->tdp);
+        tpool_rele(tgroup->tpool);
 
-    workq->growing = false;
+    tgroup->growing = false;
 }
 
 void
-xx_tdp_enqueue(struct xx_tdp_work *work, int cpu)
+tpool_enqueue(struct tpool *tpool, struct tpreq *req, int cpu)
 {
-    struct xx_tdp_workq *workq;
-    struct xx_tdp *tdp;
+    struct tgroup *tgroup;
 
-    KASSERT(work && !work->tdp || !work->func, "invalid work");
+    KASSERT(tpool && req && req->func, "invalid thread pool request");
 
-    tdp = work->tdp;
-    workq = xx_tdp_cpu2workq(tdp, cpu);
+    tgroup = tpool_cpu2tgroup(tpool, cpu);
 
     /* Append work to the target queue.  If we need to increase
      * the thread count of the target queue then append grow work
      * to the maintenance queue.
      */
-    mtx_lock(&workq->mtx);
-    STAILQ_INSERT_TAIL(&workq->head, work, wqe);
-    work = NULL;
+    mtx_lock(&tgroup->mtx);
+    STAILQ_INSERT_TAIL(&tgroup->head, req, entry);
+    req = NULL;
 
-    if (workq->tdsleeping > 0) {
-        cv_signal(&workq->cv);
+    if (tgroup->tdsleeping > 0) {
+        cv_signal(&tgroup->cv);
     }
-    else if (workq->tdcnt < workq->tdmax && !workq->growing) {
-        workq->growing = true;
-        work = &workq->grow;
-        ++workq->grows;
+    else if (tgroup->tdcnt < tgroup->tdmax && !tgroup->growing) {
+        tgroup->growing = true;
+        req = &tgroup->grow;
+        ++tgroup->grows;
     }
-    mtx_unlock(&workq->mtx);
+    mtx_unlock(&tgroup->mtx);
 
-    if (work) {
-        workq = tdp->workqv + tdp->cgmax;
+    if (req) {
+        tgroup = tpool->tgroupv + tpool->cgmax;
 
-        xx_tdp_hold(tdp);
+        tpool_hold(tpool);
 
-        mtx_lock(&workq->mtx);
-        STAILQ_INSERT_TAIL(&workq->head, work, wqe);
-        if (workq->tdsleeping > 0)
-            cv_signal(&workq->cv);
-        mtx_unlock(&workq->mtx);
+        mtx_lock(&tgroup->mtx);
+        STAILQ_INSERT_TAIL(&tgroup->head, req, entry);
+        if (tgroup->tdsleeping > 0)
+            cv_signal(&tgroup->cv);
+        mtx_unlock(&tgroup->mtx);
     }
 }
 
 void
-xx_tdp_shutdown(struct xx_tdp *tdp)
+tpool_shutdown(struct tpool *tpool)
 {
     int i;
 
-    KASSERT(tdp->magic == tdp, "invalid tdp magic");
-    KASSERT(tdp->refcnt > 0, "invalid tdp refcnt");
+    KASSERT(tpool->magic == tpool, "invalid tpool magic");
+    KASSERT(tpool->refcnt > 0, "invalid tpool refcnt");
 
-    for (i = 0; i < tdp->cgmax + 1; ++i) {
-        struct xx_tdp_workq *workq = tdp->workqv + i;
+    for (i = 0; i < tpool->cgmax + 1; ++i) {
+        struct tgroup *tgroup = tpool->tgroupv + i;
 
-        if (workq->callbacks > 0)
-            dprint("workq %2d, grows %3lu, callbacks %8lu\n",
-                   i, workq->grows, workq->callbacks);
+        if (tgroup->callbacks > 0)
+            dprint("tgroup %2d, grows %3lu, callbacks %8lu\n",
+                   i, tgroup->grows, tgroup->callbacks);
 
-        mtx_lock(&workq->mtx);
-        workq->running = false;
-        workq->tdmin = 0;
-        workq->tdmax = 0;
-        cv_broadcast(&workq->cv);
-        mtx_unlock(&workq->mtx);
+        mtx_lock(&tgroup->mtx);
+        tgroup->running = false;
+        tgroup->tdmin = 0;
+        tgroup->tdmax = 0;
+        cv_broadcast(&tgroup->cv);
+        mtx_unlock(&tgroup->mtx);
     }
 
-    for (i = 0; i < tdp->cgmax + 1; ++i) {
-        struct xx_tdp_workq *workq = tdp->workqv + i;
+    for (i = 0; i < tpool->cgmax + 1; ++i) {
+        struct tgroup *tgroup = tpool->tgroupv + i;
 
-        mtx_lock(&workq->mtx);
-        while (workq->tdcnt > 0)
-            cv_timedwait(&workq->cv, &workq->mtx, hz);
-        mtx_unlock(&workq->mtx);
+        mtx_lock(&tgroup->mtx);
+        while (tgroup->tdcnt > 0)
+            cv_timedwait(&tgroup->cv, &tgroup->mtx, hz);
+        mtx_unlock(&tgroup->mtx);
     }
 }
 
 static void
-xx_tdp_run(void *arg)
+tpool_run(void *arg)
 {
-    struct xx_tdargs *tdargs = arg;
-    struct xx_tdp_workq *workq;
-    struct xx_tdp *tdp;
+    struct tdargs *tdargs = arg;
+    struct tgroup *tgroup;
+    struct tpool *tpool;
     int timedout = 0;
 
-    tdp = tdargs->argv[0];
-    workq = tdargs->argv[1];
+    tpool = tdargs->argv[0];
+    tgroup = tdargs->argv[1];
 
-    mtx_lock(&workq->mtx);
-    ++workq->tdcnt;
+    mtx_lock(&tgroup->mtx);
+    ++tgroup->tdcnt;
 
     while (1) {
-        struct xx_tdp_work *work;
+        struct tpreq *req;
 
-        work = STAILQ_FIRST(&workq->head);
-        if (!work) {
-            if ((timedout && workq->tdcnt > workq->tdmin) || !workq->running)
+        req = STAILQ_FIRST(&tgroup->head);
+        if (!req) {
+            if ((timedout && tgroup->tdcnt > tgroup->tdmin) || !tgroup->running)
                 break;
 
-            ++workq->tdsleeping;
-            timedout = cv_timedwait(&workq->cv, &workq->mtx, hz * 30);
-            --workq->tdsleeping;
+            ++tgroup->tdsleeping;
+            timedout = cv_timedwait(&tgroup->cv, &tgroup->mtx, hz * 30);
+            --tgroup->tdsleeping;
             continue;
         }
 
-        STAILQ_REMOVE_HEAD(&workq->head, wqe);
-        ++workq->callbacks;
-        mtx_unlock(&workq->mtx);
+        STAILQ_REMOVE_HEAD(&tgroup->head, entry);
+        ++tgroup->callbacks;
+        mtx_unlock(&tgroup->mtx);
 
-        work->func(work);
+        req->func(req);
 
-        mtx_lock(&workq->mtx);
+        mtx_lock(&tgroup->mtx);
     }
 
-    if (--workq->tdcnt < 1)
-        cv_signal(&workq->cv);
-    mtx_unlock(&workq->mtx);
+    if (--tgroup->tdcnt < 1)
+        cv_signal(&tgroup->cv);
+    mtx_unlock(&tgroup->mtx);
 
-    xx_tdp_rele(tdp);
+    tpool_rele(tpool);
 
     kthread_exit();
 }
@@ -318,18 +319,18 @@ xx_tdp_run(void *arg)
 extern struct cpu_group *smp_topo(void);
 extern struct cpu_group *smp_topo_find(struct cpu_group *, int);
 
-struct xx_tdp *
-xx_tdp_create(u_int tdmin, u_int tdmax)
+struct tpool *
+tpool_create(u_int tdmin, u_int tdmax)
 {
     struct cpu_group *cpu_top, **cgv;
-    struct xx_tdp_workq *workq;
-    struct xx_tdargs *tdargs;
-    struct xx_tdp *tdp;
+    struct tgroup *tgroup;
+    struct tdargs *tdargs;
+    struct tpool *tpool;
     struct cpuset *set;
     struct thread *td;
     struct proc *proc;
     int i, rc, width;
-    size_t tdpsz;
+    size_t tpoolsz;
     int cgmax;
 
     if (tdmin > 1024 || tdmax > 1024)
@@ -346,7 +347,7 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
         return NULL;
     }
 
-    CPU_COPY(&set->cs_mask, &xx_tdp_cpuset);
+    CPU_COPY(&set->cs_mask, &tpool_cpuset);
     cpuset_rel(set);
 
     /* Count the number of cpu groups which we'll use as the number
@@ -357,50 +358,48 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
     CPU_FOREACH(i)
         ++cgmax;
 
-    cgv = malloc(sizeof(*cgv) * cgmax, M_XX_TDP, M_ZERO);
+    cgv = malloc(sizeof(*cgv) * cgmax, M_TPOOL, M_ZERO);
     if (!cgv)
         return NULL;
 
-    tdpsz = sizeof(*tdp) + sizeof(tdp->workqv[0]) * (cgmax + 1);
+    tpoolsz = sizeof(*tpool) + sizeof(tpool->tgroupv[0]) * (cgmax + 1);
 
-    tdp = contigmalloc(tdpsz, M_XX_TDP, M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
-    if (!tdp) {
-        free(cgv, M_XX_TDP);
+    tpool = contigmalloc(tpoolsz, M_TPOOL, M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+    if (!tpool) {
+        free(cgv, M_TPOOL);
         return NULL;
     }
 
-    tdp->refcnt = 2;
-    tdp->cgmax = cgmax;
-    tdp->allocsz = tdpsz;
-    tdp->magic = tdp;
+    tpool->refcnt = 2;
+    tpool->cgmax = cgmax;
+    tpool->allocsz = tpoolsz;
+    tpool->magic = tpool;
 
     for (i = 0; i < cgmax + 1; ++i) {
-        workq = tdp->workqv + i;
+        tgroup = tpool->tgroupv + i;
 
-        mtx_init(&workq->mtx, "wqmtx", NULL, MTX_DEF);
-        cv_init(&workq->cv, "wqcv");
-        STAILQ_INIT(&workq->head);
-        workq->running = true;
-        workq->tdmin = tdmin;
-        workq->tdmax = tdmax;
+        mtx_init(&tgroup->mtx, "wqmtx", NULL, MTX_DEF);
+        cv_init(&tgroup->cv, "wqcv");
+        STAILQ_INIT(&tgroup->head);
+        tgroup->running = true;
+        tgroup->tdmin = tdmin;
+        tgroup->tdmax = tdmax;
 
-        tdargs = &workq->tdargs;
-        tdargs->func = xx_tdp_run;
-        tdargs->argv[0] = tdp;
-        tdargs->argv[1] = workq;
+        tdargs = &tgroup->tdargs;
+        tdargs->func = tpool_run;
+        tdargs->argv[0] = tpool;
+        tdargs->argv[1] = tgroup;
         CPU_ZERO(&tdargs->cpuset);
-        snprintf(tdargs->name, sizeof(tdargs->name), "tdp-%d", i);
+        snprintf(tdargs->name, sizeof(tdargs->name), "tpool-%d", i);
         tdargs->prio = PRI_MAX_KERN;
 
-        workq->grow.tdp = tdp;
-        workq->grow.func = xx_tdp_grow;
-        workq->grow.argv[0] = workq;
+        tpreq_init(&tgroup->grow, tpool_grow, NULL);
 
         if (i == cgmax) {
-            strlcpy(tdargs->name, "tdp-maint", sizeof(tdargs->name));
+            strlcpy(tdargs->name, "tpool-maint", sizeof(tdargs->name));
             tdargs->prio = PRI_MAX_KERN - 1;
-            workq->tdmin = 1;
-            workq->tdmax = 1;
+            tgroup->tdmin = 1;
+            tgroup->tdmax = 1;
         }
     }
 
@@ -408,11 +407,11 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
      * and add it to the vcpu-to-thread-group map and the thead
      * group's affinity set.
      */
-    for (i = 0; i < CPU_COUNT(&xx_tdp_cpuset); ++i) {
+    for (i = 0; i < CPU_COUNT(&tpool_cpuset); ++i) {
         struct cpu_group *cg;
         int j;
 
-        if (!CPU_ISSET(i, &xx_tdp_cpuset))
+        if (!CPU_ISSET(i, &tpool_cpuset))
             continue;
 
         cg = smp_topo_find(cpu_top, i);
@@ -427,10 +426,10 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
         if (!cgv[j])
             cgv[j] = cg;
 
-        tdp->cpu2workq[i] = j;
+        tpool->cpu2tgroup[i] = j;
 
-        workq = xx_tdp_cpu2workq(tdp, i);
-        tdargs = &workq->tdargs;
+        tgroup = tpool_cpu2tgroup(tpool, i);
+        tdargs = &tgroup->tdargs;
 
         CPU_SET(i, &tdargs->cpuset);
     }
@@ -441,11 +440,11 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
     for (i = 0; i < cgmax + 1; ++i) {
         char buf[CPUSETBUFSIZ];
 
-        workq = tdp->workqv + i;
-        tdargs = &workq->tdargs;
+        tgroup = tpool->tgroupv + i;
+        tdargs = &tgroup->tdargs;
 
         if (CPU_EMPTY(&tdargs->cpuset))
-            CPU_COPY(&xx_tdp_cpuset, &tdargs->cpuset);
+            CPU_COPY(&tpool_cpuset, &tdargs->cpuset);
 
         cpusetobj_strprint(buf, &tdargs->cpuset);
         if (strlen(buf) > width)
@@ -455,43 +454,43 @@ xx_tdp_create(u_int tdmin, u_int tdmax)
     for (i = 0; i < cgmax + 1; ++i) {
         char buf[CPUSETBUFSIZ];
 
-        workq = tdp->workqv + i;
-        tdargs = &workq->tdargs;
+        tgroup = tpool->tgroupv + i;
+        tdargs = &tgroup->tdargs;
 
-        dprint("workq %3d %12s  %2u %2u  %*s\n",
-               i, tdargs->name, workq->tdmin, workq->tdmax,
+        dprint("tgroup %3d %12s  %2u %2u  %*s\n",
+               i, tdargs->name, tgroup->tdmin, tgroup->tdmax,
                width, cpusetobj_strprint(buf, &tdargs->cpuset));
     }
 
     /* Start the maintenance kthread.
      */
-    workq = tdp->workqv + cgmax;
-    tdargs = &workq->tdargs;
+    tgroup = tpool->tgroupv + cgmax;
+    tdargs = &tgroup->tdargs;
 
-    rc = xx_tdp_kthread_create(tdargs);
+    rc = tpool_kthread_create(tdargs);
     if (rc) {
         dprint("unable to create maint kthread: rc %d\n", rc);
-        free(tdp, M_XX_TDP);
-        free(cgv, M_XX_TDP);
+        free(tpool, M_TPOOL);
+        free(cgv, M_TPOOL);
         return NULL;
     }
 
-    dprint("%s: %4zu  sizeof xx_tdargs\n", __func__, sizeof(struct xx_tdargs));
-    dprint("%s: %4zu  sizeof xx_tdp_work\n", __func__, sizeof(struct xx_tdp_work));
-    dprint("%s: %4zu  sizeof xx_tdp_workq\n", __func__, sizeof(struct xx_tdp_workq));
-    dprint("%s: %4zu  sizeof xx_tdp_tdp\n", __func__, sizeof(struct xx_tdp));
+    dprint("%s: %4zu  sizeof tdargs\n", __func__, sizeof(struct tdargs));
+    dprint("%s: %4zu  sizeof tpool\n", __func__, sizeof(struct tpool));
+    dprint("%s: %4zu  sizeof tgroup\n", __func__, sizeof(struct tgroup));
+    dprint("%s: %4zu  sizeof tpreq\n", __func__, sizeof(struct tpreq));
     dprint("%s: %4u  MSIZE\n", __func__, MSIZE);
     dprint("%s: %4u  MHLEN\n", __func__, MHLEN);
     dprint("%s: %4u  MLEN\n", __func__, MLEN);
 
-    dprint("tdmin %u, tdmax %u, refcnt %d\n", tdmin, tdmax, tdp->refcnt);
+    dprint("tdmin %u, tdmax %u, refcnt %d\n", tdmin, tdmax, tpool->refcnt);
 
-    /* Consider adjusting the xx_tdp_workq padding if you see this message.
+    /* Consider adjusting the tgroup padding if you see this message.
      */
-    if (((sizeof(struct xx_tdp_workq) / CACHE_LINE_SIZE) & 1) == 0)
-        dprint("struct xx_tdp_workq is an even number of cache lines\n");
+    if (((sizeof(struct tgroup) / CACHE_LINE_SIZE) & 1) == 0)
+        dprint("struct tgroup is an even number of cache lines\n");
 
-    free(cgv, M_XX_TDP);
+    free(cgv, M_TPOOL);
 
-    return tdp;
+    return tpool;
 }
