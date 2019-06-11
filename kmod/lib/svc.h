@@ -23,46 +23,46 @@
  * SUCH DAMAGE.
  */
 
-#ifndef XX_SVC_H
-#define XX_SVC_H
+#ifndef SVC_H
+#define SVC_H
 
-struct xx_conn;
-typedef void xx_conn_cb_t(struct xx_conn *);
+struct conn;
+typedef void conn_cb_t(struct conn *);
 
-struct xx_conn {
+struct conn {
     int                     refcnt;
     bool                    active;
-    xx_conn_cb_t           *destroy;
+    conn_cb_t              *destroy;
     struct sockaddr        *laddr;
     size_t                  privsz;
-    TAILQ_ENTRY(xx_conn)    connq_entry;
+    TAILQ_ENTRY(conn)       entry;
     void                   *magic;
 
     __aligned(CACHE_LINE_SIZE)
     struct tpreq            tpreq;
     struct tpool           *tpool;
     struct socket          *so;
-    xx_conn_cb_t           *recv;
-    struct xx_svc          *svc;
+    conn_cb_t              *recv;
+    struct svc             *svc;
 
     __aligned(CACHE_LINE_SIZE)
     char                    priv[];
 };
 
 static inline void *
-xx_conn_priv(struct xx_conn *conn)
+conn_priv(struct conn *conn)
 {
     return conn->priv;
 }
 
-int xx_conn_hold(struct xx_conn *conn);
-void xx_conn_rele(struct xx_conn *conn);
-void xx_conn_reln(struct xx_conn *conn, int n);
+int conn_hold(struct conn *conn);
+void conn_rele(struct conn *conn);
+void conn_reln(struct conn *conn, int n);
 
-int xx_svc_listen(struct xx_svc *svc, int type, const char *host, in_port_t port,
-                  xx_conn_cb_t *accept_cb, xx_conn_cb_t *recv_cb,
-                  xx_conn_cb_t *destroy_cb, size_t privsz);
-int xx_svc_create(struct xx_svc **svcp);
-int xx_svc_shutdown(struct xx_svc *svc);
+int svc_listen(struct svc *svc, int type, const char *host, in_port_t port,
+               conn_cb_t *acceptb, conn_cb_t *recvb,
+               conn_cb_t *destroyb, size_t privsz);
+int svc_create(struct svc **svcp);
+int svc_shutdown(struct svc *svc);
 
-#endif /* XX_SVC_H */
+#endif /* SVC_H */

@@ -124,7 +124,7 @@ struct conn_priv {
 
 };
 
-static struct xx_svc *krpc2_svc;
+static struct svc *krpc2_svc;
 static uma_zone_t clzone;
 
 static void
@@ -133,8 +133,8 @@ krpc_send(struct tpreq *tpreq)
     struct clhead todo, done;
     struct conn_priv *priv;
     struct clreq *req, *tmp;
-    struct xx_conn *conn;
     struct mbuf *mreply;
+    struct conn *conn;
     int sndpercb = 16;
     int refs = 0;
     int rc;
@@ -145,7 +145,7 @@ krpc_send(struct tpreq *tpreq)
     conn = tpreq->arg;
     tpreq = NULL;
 
-    priv = xx_conn_priv(conn);
+    priv = conn_priv(conn);
 
     mtx_lock(&priv->txq_mtx);
     STAILQ_CONCAT(&todo, &priv->txq_head);
@@ -201,7 +201,7 @@ krpc_send(struct tpreq *tpreq)
         ++refs;
     }
 
-    xx_conn_reln(conn, refs);
+    conn_reln(conn, refs);
 }
 
 static void
@@ -209,15 +209,15 @@ krpc_recv_rpc(struct tpreq *tpreq)
 {
     enum accept_stat ar_stat;
     struct conn_priv *priv;
-    struct xx_conn *conn;
     struct rpc_msg *msg;
     struct clreq *req;
+    struct conn *conn;
     struct mbuf *h;
     uint32_t mark;
 
     req = container_of(tpreq, struct clreq, tpreq);
     conn = tpreq->arg;
-    priv = xx_conn_priv(conn);
+    priv = conn_priv(conn);
 
     /* Decode the incoming RPC call message...
      */
@@ -231,7 +231,7 @@ krpc_recv_rpc(struct tpreq *tpreq)
         eprint("%s: xdr_callmsg failed: xid %u, len %u\n",
                __func__, msg->rm_xid, m_length(req->mcall, NULL));
         uma_zfree(clzone, req);
-        xx_conn_rele(conn);
+        conn_rele(conn);
         return;
     }
 
@@ -273,7 +273,7 @@ krpc_recv_rpc(struct tpreq *tpreq)
     if (!xdr_replymsg(&req->rxdr, msg)) {
         eprint("%s: xdr_replymsg failed: xid %u\n", __func__, msg->rm_xid);
         uma_zfree(clzone, req);
-        xx_conn_rele(conn);
+        conn_rele(conn);
         m_freem(h);
         return;
     }
@@ -286,7 +286,7 @@ krpc_recv_rpc(struct tpreq *tpreq)
         if (!h) {
             eprint("%s: m_pullup mark failed: xid %u\n", __func__, msg->rm_xid);
             uma_zfree(clzone, req);
-            xx_conn_rele(conn);
+            conn_rele(conn);
             return;
         }
     }
@@ -313,7 +313,7 @@ krpc_recv_rpc(struct tpreq *tpreq)
  * status or has data ready to read.
  */
 static void
-krpc_recv_tcp(struct xx_conn *conn)
+krpc_recv_tcp(struct conn *conn)
 {
     struct socket *so = conn->so;
     struct conn_priv *priv;
@@ -325,7 +325,7 @@ krpc_recv_tcp(struct xx_conn *conn)
     int flags;
     int rc;
 
-    priv = xx_conn_priv(conn);
+    priv = conn_priv(conn);
 
     uio.uio_resid = IP_MAXPACKET;
     uio.uio_td = curthread;
@@ -342,7 +342,7 @@ krpc_recv_tcp(struct xx_conn *conn)
             }
 
             conn->active = false;
-            xx_conn_rele(conn);
+            conn_rele(conn);
         }
 
         return;
@@ -406,7 +406,7 @@ krpc_recv_tcp(struct xx_conn *conn)
         clreq->mcall = priv->mcall;
         priv->mcall = NULL;
 
-        xx_conn_hold(conn);
+        conn_hold(conn);
 
         tpreq = &clreq->tpreq;
         tpreq_init(tpreq, krpc_recv_rpc, conn);
@@ -434,9 +434,9 @@ krpc_recv_tcp(struct xx_conn *conn)
  * the ideal place to initialize the connection private data.
  */
 static void
-krpc_accept_cb(struct xx_conn *conn)
+krpc_accept_cb(struct conn *conn)
 {
-    struct conn_priv *priv = xx_conn_priv(conn);
+    struct conn_priv *priv = conn_priv(conn);
 
     mtx_init(&priv->txq_mtx, "rpcmtx", NULL, MTX_DEF);
     STAILQ_INIT(&priv->txq_head);
@@ -451,9 +451,9 @@ krpc_accept_cb(struct xx_conn *conn)
  * ideal place to teardown the connection private data.
  */
 static void
-krpc_destroy_cb(struct xx_conn *conn)
+krpc_destroy_cb(struct conn *conn)
 {
-    struct conn_priv *priv = xx_conn_priv(conn);
+    struct conn_priv *priv = conn_priv(conn);
 
     KASSERT(priv->inited, "priv not initialized");
 
@@ -484,32 +484,32 @@ int
 krpc2_mod_load(module_t mod, int cmd, void *data)
 {
     const char *host = "0.0.0.0";
-    struct xx_svc *svc;
+    struct svc *svc;
     int rc;
 
     clzone = uma_zcreate(KSF_MOD_NAME "_clzone",
                          sizeof(struct clreq),
                          NULL, krpc_clzone_dtor, NULL, NULL,
-                         CACHE_LINE_SIZE, UMA_ZONE_ZINIT);
+                         UMA_ALIGN_CACHE, UMA_ZONE_ZINIT);
     if (!clzone)
         return ENOMEM;
 
     /* TODO: Provide an alternate way to start/stop services
      * so that we can avoid doing it in module load/unload.
      */
-    rc = xx_svc_create(&svc);
+    rc = svc_create(&svc);
     if (rc) {
-        eprint("xx_svc_create() failed: %d\n", rc);
+        eprint("svc_create() failed: %d\n", rc);
         uma_zdestroy(clzone);
         return rc;
     }
 
-    rc = xx_svc_listen(svc, SOCK_STREAM, host, xx_port,
-                       krpc_accept_cb, krpc_recv_tcp, krpc_destroy_cb,
-                       sizeof(struct conn_priv));
+    rc = svc_listen(svc, SOCK_STREAM, host, xx_port,
+                    krpc_accept_cb, krpc_recv_tcp, krpc_destroy_cb,
+                    sizeof(struct conn_priv));
     if (rc) {
-        eprint("xx_svc_listen() failed: %d\n", rc);
-        xx_svc_shutdown(svc);
+        eprint("svc_listen() failed: %d\n", rc);
+        svc_shutdown(svc);
         uma_zdestroy(clzone);
         return rc;
     }
@@ -524,7 +524,7 @@ krpc2_mod_unload(module_t mod, int cmd, void *data)
 {
     int rc;
 
-    rc = xx_svc_shutdown(krpc2_svc);
+    rc = svc_shutdown(krpc2_svc);
 
     dprint("%s: rc %d\n", __func__, rc);
 

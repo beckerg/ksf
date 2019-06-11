@@ -71,17 +71,17 @@ struct conn_priv {
  * is where we teardown the connection private data.
  */
 static void
-kecho_destroy_cb(struct xx_conn *conn)
+kecho_destroy_cb(struct conn *conn)
 {
-    struct conn_priv *priv = xx_conn_priv(conn);
+    struct conn_priv *priv = conn_priv(conn);
 
     m_freem(priv->hdr);
 }
 
 static void
-kecho_recv_tcp(struct xx_conn *conn)
+kecho_recv_tcp(struct conn *conn)
 {
-    struct conn_priv *priv = xx_conn_priv(conn);
+    struct conn_priv *priv = conn_priv(conn);
     struct socket *so = conn->so;
     struct mbuf *m = NULL;
     int rcvpercall = 8;
@@ -101,12 +101,12 @@ kecho_recv_tcp(struct xx_conn *conn)
     if (rc || !m) {
         if (rc != EWOULDBLOCK) {
             if (rc) {
-                dprint("soreceive: tcp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-                       conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+                dprint("soreceive: tcp conn %p, rc %d, m %p, flags %x\n",
+                       conn, rc, m, flags);
             }
 
             conn->active = false;
-            xx_conn_rele(conn);
+            conn_rele(conn);
         }
 
         return;
@@ -120,10 +120,10 @@ kecho_recv_tcp(struct xx_conn *conn)
 
     rc = sosend(so, NULL, NULL, h, NULL, 0, curthread);
     if (rc) {
-        dprint("sosend: tcp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-               conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+        dprint("sosend: tcp conn %p, rc %d, m %p, flags %x\n",
+               conn, rc, m, flags);
         conn->active = false;
-        xx_conn_rele(conn);
+        conn_rele(conn);
     }
 
     priv->hdr = m_gethdr(M_NOWAIT, MT_DATA);
@@ -133,9 +133,9 @@ kecho_recv_tcp(struct xx_conn *conn)
 }
 
 static void
-kecho_recv_udp(struct xx_conn *conn)
+kecho_recv_udp(struct conn *conn)
 {
-    struct conn_priv *priv = xx_conn_priv(conn);
+    struct conn_priv *priv = conn_priv(conn);
     struct socket *so = conn->so;
     struct sockaddr *faddr;
     int rcvpercall = 8;
@@ -157,12 +157,12 @@ kecho_recv_udp(struct xx_conn *conn)
     if (rc || !m) {
         if (rc != EWOULDBLOCK) {
             if (rc) {
-                dprint("soreceive: udp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-                       conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+                dprint("soreceive: udp conn %p, rc %d, m %p, flags %x\n",
+                       conn, rc, m, flags);
             }
 
             conn->active = false;
-            xx_conn_rele(conn);
+            conn_rele(conn);
         }
 
         return;
@@ -176,10 +176,10 @@ kecho_recv_udp(struct xx_conn *conn)
 
     rc = sosend(so, faddr, NULL, h, NULL, 0, curthread);
     if (rc) {
-        dprint("sosend: udp conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-               conn, rc, m, flags, conn->nsoupcalls, conn->ncallbacks);
+        dprint("sosend: udp conn %p, rc %d, m %p, flags %x\n",
+               conn, rc, m, flags);
         conn->active = false;
-        xx_conn_rele(conn);
+        conn_rele(conn);
     }
 
     free(faddr, M_SONAME);
@@ -190,35 +190,35 @@ kecho_recv_udp(struct xx_conn *conn)
         goto again;
 }
 
-static struct xx_svc *kecho_svc;
+static struct svc *kecho_svc;
 
 int
 kecho_mod_load(module_t mod, int cmd, void *data)
 {
     const char *host = "0.0.0.0";
     in_port_t port = 60007;
-    struct xx_svc *svc;
+    struct svc *svc;
     int rc;
 
-    rc = xx_svc_create(&svc);
+    rc = svc_create(&svc);
     if (rc) {
-        eprint("xx_svc_create() failed: %d\n", rc);
+        eprint("svc_create() failed: %d\n", rc);
         return rc;
     }
 
 #if 1
-    rc = xx_svc_listen(svc, SOCK_DGRAM, host, port,
-                       NULL, kecho_recv_udp, kecho_destroy_cb,
-                       sizeof(struct conn_priv));
+    rc = svc_listen(svc, SOCK_DGRAM, host, port,
+                    NULL, kecho_recv_udp, kecho_destroy_cb,
+                    sizeof(struct conn_priv));
     if (rc)
-        eprint("xx_svc_listen() failed: udp, rc %d\n", rc);
+        eprint("svc_listen() failed: udp, rc %d\n", rc);
 #endif
 
-    rc = xx_svc_listen(svc, SOCK_STREAM, host, port,
-                       NULL, kecho_recv_tcp, kecho_destroy_cb,
-                       sizeof(struct conn_priv));
+    rc = svc_listen(svc, SOCK_STREAM, host, port,
+                    NULL, kecho_recv_tcp, kecho_destroy_cb,
+                    sizeof(struct conn_priv));
     if (rc)
-        eprint("xx_svc_listen() failed: tcp, rc %d\n", rc);
+        eprint("svc_listen() failed: tcp, rc %d\n", rc);
 
     kecho_svc = svc;
 
@@ -230,7 +230,7 @@ kecho_mod_unload(module_t mod, int cmd, void *data)
 {
     int rc;
 
-    rc = xx_svc_shutdown(kecho_svc);
+    rc = svc_shutdown(kecho_svc);
     if (rc)
         return rc;
 
