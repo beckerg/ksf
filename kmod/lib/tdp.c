@@ -72,17 +72,16 @@ STAILQ_HEAD(twhead, tpreq);
 struct tgroup {
     struct mtx          mtx;
     struct twhead       head;
+    u_long              callbacks;
     bool                running;
     bool                growing;
-    u_int               tdsleeping;
-    u_int               tdcnt;
-    u_int               tdmax;
-    u_int               tdmin;
-    u_int               spare;
+    uint16_t            tdsleeping;
+    uint16_t            tdcnt;
+    uint16_t            tdmax;
 
-    u_long              callbacks;
-    u_long              grows;
     struct cv           cv;
+    uint16_t            tdmin;
+    u_long              grows;
     struct tpreq        grow;
 
     struct tpool       *tpool;
@@ -94,7 +93,11 @@ struct tgroup {
     char                pad[CACHE_LINE_SIZE];
 } __aligned(CACHE_LINE_SIZE);
 
-
+/* A thread pool exists for the purpose of asynchronous task
+ * execution that requiring kthread context.  It is comprised
+ * of one or more thread groups, where there is one thread
+ * group for each core.
+ */
 struct tpool {
 #if MAXCPU > 256
     uint16_t            cpu2tgroup[MAXCPU];
@@ -283,10 +286,13 @@ tpool_run(void *arg)
 
     mtx_lock(&tgroup->mtx);
     ++tgroup->tdcnt;
+    mtx_unlock(&tgroup->mtx);
 
     while (1) {
         struct tpreq *req;
 
+        mtx_lock(&tgroup->mtx);
+      again:
         req = STAILQ_FIRST(&tgroup->head);
         if (!req) {
             if ((timedout && tgroup->tdcnt > tgroup->tdmin) || !tgroup->running)
@@ -295,7 +301,7 @@ tpool_run(void *arg)
             ++tgroup->tdsleeping;
             timedout = cv_timedwait(&tgroup->cv, &tgroup->mtx, hz * 30);
             --tgroup->tdsleeping;
-            continue;
+            goto again;
         }
 
         STAILQ_REMOVE_HEAD(&tgroup->head, entry);
@@ -303,8 +309,6 @@ tpool_run(void *arg)
         mtx_unlock(&tgroup->mtx);
 
         req->func(req);
-
-        mtx_lock(&tgroup->mtx);
     }
 
     if (--tgroup->tdcnt < 1)
@@ -457,7 +461,7 @@ tpool_create(u_int tdmin, u_int tdmax)
         tgroup = tpool->tgroupv + i;
         tdargs = &tgroup->tdargs;
 
-        dprint("tgroup %3d %12s  %2u %2u  %*s\n",
+        dprint("tgroup %3d %-12s  %2u %2u  %*s\n",
                i, tdargs->name, tgroup->tdmin, tgroup->tdmax,
                width, cpusetobj_strprint(buf, &tdargs->cpuset));
     }
