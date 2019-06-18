@@ -24,7 +24,6 @@
  */
 
 #include <sys/param.h>
-#include <sys/limits.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/kthread.h>
@@ -34,21 +33,12 @@
 #include <sys/proc.h>
 #include <sys/condvar.h>
 #include <sys/sched.h>
-#include <sys/sdt.h>
 #include <sys/smp.h>
 #include <vm/uma.h>
 #include <sys/unistd.h>
-#include <machine/stdarg.h>
 #include <sys/sysctl.h>
 #include <sys/cpuset.h>
-#include <sys/sbuf.h>
-#include <sys/mman.h>
-#include <sys/module.h>
-
-#include <sys/mbuf.h>
-#include <sys/socket.h>
-#include <sys/socketvar.h>
-#include <netinet/in.h>
+#include <machine/stdarg.h>
 
 #include "xx.h"
 #include "tdp.h"
@@ -75,7 +65,7 @@ struct tgroup {
     u_long              callbacks;
     bool                running;
     bool                growing;
-    uint16_t            tdsleeping;
+    uint16_t            waiters;
     uint16_t            tdcnt;
     uint16_t            tdmax;
 
@@ -86,11 +76,6 @@ struct tgroup {
 
     struct tpool       *tpool;
     struct tdargs       tdargs;
-
-    /* Add extra padding so that the size is an odd number
-     * of cache lines.
-     */
-    char                pad[CACHE_LINE_SIZE];
 } __aligned(CACHE_LINE_SIZE);
 
 /* A thread pool exists for the purpose of asynchronous task
@@ -107,7 +92,7 @@ struct tpool {
     int                 refcnt;
     int                 cgmax;
     size_t              allocsz;
-    void               *magic;
+    uintptr_t           magic;
 
     struct tgroup       tgroupv[];
 };
@@ -125,7 +110,7 @@ tpool_cpu2tgroup(struct tpool *tpool, int cpu)
 /* Create and start a kernel thread.
  */
 static int
-tpool_kthread_create(struct tdargs *tdargs)
+tpool_kthread_add(struct tdargs *tdargs)
 {
     struct thread *td;
     int rc;
@@ -151,11 +136,13 @@ tpool_kthread_create(struct tdargs *tdargs)
     return 0;
 }
 
-static int
+int
 tpool_hold(struct tpool *tpool)
 {
-    KASSERT(tpool->magic == tpool, "invalid tpool magic");
-    KASSERT(tpool->refcnt > 0, "invalid tpool refcnt");
+    KASSERT(tpool->magic == (uintptr_t)tpool,
+            ("bad magic: tpool %p, magic %lx", tpool, tpool->magic));
+    KASSERT(tpool->refcnt > 0,
+            ("bad refcnt: tpool %p, refcnt %d", tpool, tpool->refcnt));
 
     return atomic_fetchadd_int(&tpool->refcnt, 1) + 1;
 }
@@ -165,24 +152,21 @@ tpool_rele(struct tpool *tpool)
 {
     int i;
 
-    KASSERT(tpool->magic == tpool, "invalid tpool magic");
-    KASSERT(tpool->refcnt > 0, "invalid tpool refcnt");
+    KASSERT(tpool->magic == (uintptr_t)tpool,
+            ("bad magic: tpool %p, magic %lx", tpool, tpool->magic));
+    KASSERT(tpool->refcnt > 0,
+            ("bad refcnt: tpool %p, refcnt %d", tpool, tpool->refcnt));
 
     if (atomic_fetchadd_int(&tpool->refcnt, -1) > 1)
         return;
-
-    /* Give kthreads a brief opportunity to finish exiting.
-     * Is there a way to to this synchronously???
-     */
-    tsleep(tpool, 0, "tpwait", 1);
 
     for (i = 0; i < tpool->cgmax + 1; ++i) {
         mtx_destroy(&tpool->tgroupv[i].mtx);
         cv_destroy(&tpool->tgroupv[i].cv);
     }
 
-    tpool->magic = NULL;
-    contigfree(tpool, tpool->allocsz, M_TPOOL);
+    tpool->magic = ~tpool->magic;
+    free(tpool, M_TPOOL);
 }
 
 static void
@@ -191,9 +175,9 @@ tpool_grow(struct tpreq *req)
     struct tgroup *tgroup = container_of(req, struct tgroup, grow);
     int rc;
 
-    KASSERT(req && tgroup && ttpool, "invalid thread pool request");
+    KASSERT(req && tgroup, ("invalid thread pool request"));
 
-    rc = tpool_kthread_create(&tgroup->tdargs);
+    rc = tpool_kthread_add(&tgroup->tdargs);
     if (rc)
         tpool_rele(tgroup->tpool);
 
@@ -205,7 +189,7 @@ tpool_enqueue(struct tpool *tpool, struct tpreq *req, int cpu)
 {
     struct tgroup *tgroup;
 
-    KASSERT(tpool && req && req->func, "invalid thread pool request");
+    KASSERT(tpool && req && req->func, ("invalid thread pool request"));
 
     tgroup = tpool_cpu2tgroup(tpool, cpu);
 
@@ -217,7 +201,7 @@ tpool_enqueue(struct tpool *tpool, struct tpreq *req, int cpu)
     STAILQ_INSERT_TAIL(&tgroup->head, req, entry);
     req = NULL;
 
-    if (tgroup->tdsleeping > 0) {
+    if (tgroup->waiters > 0) {
         cv_signal(&tgroup->cv);
     }
     else if (tgroup->tdcnt < tgroup->tdmax && !tgroup->growing) {
@@ -234,7 +218,7 @@ tpool_enqueue(struct tpool *tpool, struct tpreq *req, int cpu)
 
         mtx_lock(&tgroup->mtx);
         STAILQ_INSERT_TAIL(&tgroup->head, req, entry);
-        if (tgroup->tdsleeping > 0)
+        if (tgroup->waiters > 0)
             cv_signal(&tgroup->cv);
         mtx_unlock(&tgroup->mtx);
     }
@@ -245,9 +229,13 @@ tpool_shutdown(struct tpool *tpool)
 {
     int i;
 
-    KASSERT(tpool->magic == tpool, "invalid tpool magic");
-    KASSERT(tpool->refcnt > 0, "invalid tpool refcnt");
+    KASSERT(tpool->magic == (uintptr_t)tpool,
+            ("bad magic: tpool %p, magic %lx", tpool, tpool->magic));
+    KASSERT(tpool->refcnt > 0,
+            ("bad refcnt: tpool %p, refcnt %d", tpool, tpool->refcnt));
 
+    /* Awaken all worker threads and tell them to exit.
+     */
     for (i = 0; i < tpool->cgmax + 1; ++i) {
         struct tgroup *tgroup = tpool->tgroupv + i;
 
@@ -263,6 +251,8 @@ tpool_shutdown(struct tpool *tpool)
         mtx_unlock(&tgroup->mtx);
     }
 
+    /* Wait for all worker threads to leave the run loop.
+     */
     for (i = 0; i < tpool->cgmax + 1; ++i) {
         struct tgroup *tgroup = tpool->tgroupv + i;
 
@@ -271,6 +261,18 @@ tpool_shutdown(struct tpool *tpool)
             cv_timedwait(&tgroup->cv, &tgroup->mtx, hz);
         mtx_unlock(&tgroup->mtx);
     }
+
+    /* Wait for all worker threads to drop their tpool references.
+     */
+    while (atomic_load_int(&tpool->refcnt) > 1)
+        tsleep(tpool, 0, "tpwait1", hz / 10);
+
+    /* Wait for all kthreads to exit.  Is there a way to do this
+     * synchronously (other than sleeping on struct thread?)
+     */
+    for (i = 0; i < 5; ++i)
+        tsleep(tpool, 0, "tpwait2", hz / 10);
+    tpool_rele(tpool);
 }
 
 static void
@@ -298,9 +300,9 @@ tpool_run(void *arg)
             if ((timedout && tgroup->tdcnt > tgroup->tdmin) || !tgroup->running)
                 break;
 
-            ++tgroup->tdsleeping;
+            ++tgroup->waiters;
             timedout = cv_timedwait(&tgroup->cv, &tgroup->mtx, hz * 30);
-            --tgroup->tdsleeping;
+            --tgroup->waiters;
             goto again;
         }
 
@@ -362,22 +364,24 @@ tpool_create(u_int tdmin, u_int tdmax)
     CPU_FOREACH(i)
         ++cgmax;
 
-    cgv = malloc(sizeof(*cgv) * cgmax, M_TPOOL, M_ZERO);
+    cgv = malloc(sizeof(*cgv) * cgmax, M_TPOOL, M_ZERO | M_WAITOK);
     if (!cgv)
         return NULL;
 
     tpoolsz = sizeof(*tpool) + sizeof(tpool->tgroupv[0]) * (cgmax + 1);
 
-    tpool = contigmalloc(tpoolsz, M_TPOOL, M_ZERO, 0, ~(vm_paddr_t)0, PAGE_SIZE, 0);
+    tpool = malloc(tpoolsz, M_TPOOL, M_ZERO | M_WAITOK);
     if (!tpool) {
         free(cgv, M_TPOOL);
         return NULL;
     }
 
+    dprint("%s: tpool %p, %lx, %lx\n",
+           __func__, tpool, (uintptr_t)tpool & 63, (uintptr_t)tpool & 4095);
     tpool->refcnt = 2;
     tpool->cgmax = cgmax;
     tpool->allocsz = tpoolsz;
-    tpool->magic = tpool;
+    tpool->magic = (uintptr_t)tpool;
 
     for (i = 0; i < cgmax + 1; ++i) {
         tgroup = tpool->tgroupv + i;
@@ -438,6 +442,8 @@ tpool_create(u_int tdmin, u_int tdmax)
         CPU_SET(i, &tdargs->cpuset);
     }
 
+    free(cgv, M_TPOOL);
+
     /* Ensure that each thread group's affinity set is non-zero.
      */
     width = 0;
@@ -471,30 +477,23 @@ tpool_create(u_int tdmin, u_int tdmax)
     tgroup = tpool->tgroupv + cgmax;
     tdargs = &tgroup->tdargs;
 
-    rc = tpool_kthread_create(tdargs);
+    rc = tpool_kthread_add(tdargs);
     if (rc) {
         dprint("unable to create maint kthread: rc %d\n", rc);
-        free(tpool, M_TPOOL);
-        free(cgv, M_TPOOL);
+        tpool_rele(tpool);
+        tpool_rele(tpool);
         return NULL;
     }
 
+    dprint("%s: %4zu  sizeof mtx\n", __func__, sizeof(struct mtx));
+    dprint("%s: %4zu  sizeof cv\n", __func__, sizeof(struct cv));
     dprint("%s: %4zu  sizeof tdargs\n", __func__, sizeof(struct tdargs));
     dprint("%s: %4zu  sizeof tpool\n", __func__, sizeof(struct tpool));
     dprint("%s: %4zu  sizeof tgroup\n", __func__, sizeof(struct tgroup));
+    dprint("%s: %4zu  offsetof tgroup.cv\n", __func__, offsetof(struct tgroup, cv));
     dprint("%s: %4zu  sizeof tpreq\n", __func__, sizeof(struct tpreq));
-    dprint("%s: %4u  MSIZE\n", __func__, MSIZE);
-    dprint("%s: %4u  MHLEN\n", __func__, MHLEN);
-    dprint("%s: %4u  MLEN\n", __func__, MLEN);
 
     dprint("tdmin %u, tdmax %u, refcnt %d\n", tdmin, tdmax, tpool->refcnt);
-
-    /* Consider adjusting the tgroup padding if you see this message.
-     */
-    if (((sizeof(struct tgroup) / CACHE_LINE_SIZE) & 1) == 0)
-        dprint("struct tgroup is an even number of cache lines\n");
-
-    free(cgv, M_TPOOL);
 
     return tpool;
 }

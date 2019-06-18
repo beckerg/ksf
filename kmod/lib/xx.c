@@ -24,34 +24,14 @@
  */
 
 #include <sys/param.h>
-#include <sys/limits.h>
-#include <sys/systm.h>
 #include <sys/kernel.h>
-#include <sys/kthread.h>
-#include <sys/lock.h>
 #include <sys/malloc.h>
-#include <sys/mutex.h>
-#include <sys/sx.h>
-#include <sys/rmlock.h>
-#include <sys/rwlock.h>
-#include <sys/proc.h>
-#include <sys/condvar.h>
-#include <sys/sched.h>
-#include <vm/uma.h>
 #include <sys/unistd.h>
-#include <machine/stdarg.h>
 #include <sys/sysctl.h>
-#include <sys/smp.h>
-#include <sys/cpuset.h>
-#include <sys/sbuf.h>
-#include <sys/mman.h>
 #include <sys/module.h>
-#include <netinet/in.h>
-
-#include <sys/mbuf.h>
 #include <sys/socket.h>
 #include <sys/socketvar.h>
-#include <netinet/in.h>
+#include <machine/stdarg.h>
 
 #include "xx.h"
 
@@ -60,7 +40,7 @@
 
 static moduledata_t xx_mod;
 
-u_int xx_debug = 1;
+u_int xx_debug = 0;
 
 void
 xx_dprint(u_int lvl, const char *func, int line, const char *fmt, ...)

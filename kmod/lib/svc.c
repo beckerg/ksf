@@ -24,7 +24,6 @@
  */
 
 #include <sys/param.h>
-#include <sys/limits.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/kthread.h>
@@ -63,7 +62,7 @@ struct svc {
     struct cv               cv;
     TAILQ_HEAD(, conn)      connq;
 
-    void                   *magic;
+    uintptr_t               magic;
 };
 
 struct svc_lsn_priv {
@@ -76,34 +75,34 @@ struct svc_lsn_priv {
 static int svc_hold(struct svc *svc);
 static int svc_rele(struct svc *svc);
 
-int
-conn_hold(struct conn *conn)
-{
-    KASSERT(conn->refcnt > 0, "invalid conn refcnt");
-
-    return atomic_fetchadd_int(&conn->refcnt, 1) + 1;
-}
+static int svc_lsn_soupcall(struct socket *so, void *arg, int wait);
+static int svc_rcv_soupcall(struct socket *so, void *arg, int wait);
 
 static void
 conn_destroy(struct conn *conn)
 {
     struct svc *svc = conn->svc;
 
-    KASSERT(conn->magic == conn, "invalid conn magic");
-    KASSERT(conn->refcnt == 0, "invalid conn refcnt");
+    KASSERT(conn->magic == (uintptr_t)conn,
+            ("bad magic: conn %p, magic %lx", conn, conn->magic));
+    KASSERT(conn->refcnt == 0,
+            ("bad refcnt: conn %p, refcnt %d", conn, conn->refcnt));
 
     mtx_lock(&svc->mtx);
     TAILQ_REMOVE(&svc->connq, conn, entry);
-    conn->active = false;
     mtx_unlock(&svc->mtx);
+
+    soclose(conn->so);
+    conn->so = NULL;
+
+    free(conn->laddr, M_SONAME);
+    conn->laddr = NULL;
+
+    conn->magic = ~conn->magic;
 
     if (conn->destroy)
         conn->destroy(conn);
 
-    soclose(conn->so);
-    free(conn->laddr, M_SONAME);
-
-    conn->magic = NULL;
     free(conn, M_CONN);
 
     mtx_lock(&svc->mtx);
@@ -112,12 +111,25 @@ conn_destroy(struct conn *conn)
     mtx_unlock(&svc->mtx);
 }
 
+int
+conn_hold(struct conn *conn)
+{
+    KASSERT(conn->magic == (uintptr_t)conn,
+            ("bad magic: conn %p, magic %lx", conn, conn->magic));
+    KASSERT(conn->refcnt > 0,
+            ("bad refcnt: conn %p, refcnt %d", conn, conn->refcnt));
+
+    return atomic_fetchadd_int(&conn->refcnt, 1) + 1;
+}
+
 void
 conn_reln(struct conn *conn, int n)
 {
-    KASSERT(conn->magic == conn, "invalid conn magic");
-    KASSERT(conn->refcnt > 0, "invalid conn refcnt zero");
-    KASSERT(conn->refcnt >= n, "invalid conn refcnt");
+    KASSERT(conn->magic == (uintptr_t)conn,
+            ("bad magic: conn %p, magic %lx", conn, conn->magic));
+    KASSERT(conn->refcnt >= n,
+            ("bad refcnt: conn %p, refcnt %d, n %d",
+             conn, conn->refcnt, n));
 
     if (atomic_fetchadd_int(&conn->refcnt, -n) > n)
         return;
@@ -125,16 +137,10 @@ conn_reln(struct conn *conn, int n)
     conn_destroy(conn);
 }
 
-void
-conn_rele(struct conn *conn)
-{
-    conn_reln(conn, 1);
-}
-
 static struct conn *
 conn_create(struct svc *svc, struct socket *so,
-            tpool_cb_t *soupcallcb, conn_cb_t *recv,
-            conn_cb_t *destroy, size_t privsz)
+            tpool_cb_t *soupcallcb, conn_cb_t *recv, conn_cb_t *destroy,
+            size_t privsz)
 {
     struct conn *conn;
     size_t sz;
@@ -147,11 +153,11 @@ conn_create(struct svc *svc, struct socket *so,
         conn->svc = svc;
         conn->tpool = svc->tpool;
         conn->refcnt = 1;
-        conn->active = true;
+        conn->shut_wr = false;
         conn->recv = recv;
         conn->destroy = destroy;
         conn->privsz = privsz;
-        conn->magic = conn;
+        conn->magic = (uintptr_t)conn;
 
         tpreq_init(&conn->tpreq, soupcallcb, NULL);
 
@@ -161,9 +167,6 @@ conn_create(struct svc *svc, struct socket *so,
         mtx_unlock(&svc->mtx);
     }
 
-    if ((uintptr_t)conn % __alignof(*conn))
-        dprint("conn %p not %zu-byte aligned\n", conn, __alignof(*conn));
-
     return conn;
 }
 
@@ -172,8 +175,7 @@ conn_create(struct svc *svc, struct socket *so,
  * called via the thread pool so that svc_rcv_receive() can run in
  * a kthread context outside of the socket receive lock.
  */
-static
-int
+static int
 svc_rcv_soupcall(struct socket *so, void *arg, int wait)
 {
     struct conn *conn = arg;
@@ -191,29 +193,32 @@ static void
 svc_rcv_receive(struct tpreq *req)
 {
     struct conn *conn = container_of(req, struct conn, tpreq);
+    struct sockbuf *sb;
+    struct socket *so;
+    int refs;
 
     conn->recv(conn);
 
     /* Reschedule this callback if there is more data to be read,
      * otherwise re-arm the socket receive upcall.
      */
-    if (conn->active) {
-        struct socket *so = conn->so;
-        bool rearm;
+    so = conn->so;
+    sb = &so->so_rcv;
+    refs = 0;
 
-        SOCKBUF_LOCK(&so->so_rcv);
-        rearm = !soreadable(so);
-        if (rearm)
-            soupcall_set(so, SO_RCV, svc_rcv_soupcall, conn);
-        SOCKBUF_UNLOCK(&so->so_rcv);
-
-        if (!rearm) {
-            tpool_enqueue(conn->tpool, &conn->tpreq, curcpu);
-            conn_hold(conn);
-        }
+    SOCKBUF_LOCK(sb);
+    if (so->so_error || (sb->sb_state & SBS_CANTRCVMORE)) {
+        refs = 2;
+    } else if (sbavail(sb) < sb->sb_lowat) {
+        soupcall_set(so, SO_RCV, svc_rcv_soupcall, conn);
+        refs = 1;
     }
+    SOCKBUF_UNLOCK(sb);
 
-    conn_rele(conn);
+    if (refs > 0)
+        conn_reln(conn, refs);
+    else
+        tpool_enqueue(conn->tpool, &conn->tpreq, curcpu);
 }
 
 /* svc_lsn_soupcall() is called by the socket layer when a new
@@ -222,8 +227,7 @@ svc_rcv_receive(struct tpreq *req)
  * pool so that svc_accept() can run in a kthread context
  * outside of the socket listen lock.
  */
-static
-int
+static int
 svc_lsn_soupcall(struct socket *so, void *arg, int wait)
 {
     struct conn *conn = arg;
@@ -247,24 +251,19 @@ svc_accept_tcp(struct tpreq *req)
     struct conn *conn = NULL;
     struct socket *head;
     short nbio;
+    int error;
+    int refs;
     int rc;
 
     head = lsn->so;
 
     SOLISTEN_LOCK(head);
     nbio = head->so_state & SS_NBIO;
-
-    rc = solisten_dequeue(head, &so, 0);
+    error = solisten_dequeue(head, &so, 0);
     KNOTE_UNLOCKED(&head->so_rdsel.si_note, 0);
 
-    if (rc) {
-        eprint("solist_dequeue: lsn %p, rc %d\n", lsn, rc);
-        if (rc != EWOULDBLOCK) {
-            lsn->active = false;
-            conn_rele(lsn);
-        }
+    if (error)
         goto errout;
-    }
 
     so->so_state |= nbio;
 
@@ -296,27 +295,26 @@ svc_accept_tcp(struct tpreq *req)
      * otherwise re-arm the socket listen upcall.
      */
   errout:
-    if (lsn->active) {
-        bool rearm;
+    refs = 0;
 
-        SOLISTEN_LOCK(head);
-        rearm = TAILQ_EMPTY(&head->sol_comp);
-        if (rearm)
-            solisten_upcall_set(head, svc_lsn_soupcall, lsn);
-        SOLISTEN_UNLOCK(head);
-
-        if (!rearm) {
-            tpool_enqueue(lsn->tpool, &lsn->tpreq, curcpu);
-            conn_hold(lsn);
-        }
+    SOLISTEN_LOCK(head);
+    if (head->so_error || error) {
+        refs = 2;
+    } else if (TAILQ_EMPTY(&head->sol_comp)) {
+        solisten_upcall_set(head, svc_lsn_soupcall, lsn);
+        refs = 1;
     }
+    SOLISTEN_UNLOCK(head);
 
     if (so) {
         free(laddr, M_SONAME);
         soclose(so);
     }
 
-    conn_rele(lsn);
+    if (refs > 0)
+        conn_reln(lsn, refs);
+    else
+        tpool_enqueue(lsn->tpool, &lsn->tpreq, curcpu);
 }
 
 static void
@@ -455,8 +453,10 @@ svc_listen(struct svc *svc, int type, const char *host, in_port_t port,
 static int
 svc_hold(struct svc *svc)
 {
-    KASSERT(svc->magic == svc, "invalid svc magic");
-    KASSERT(svc->refcnt > 0, "invalid svc refcnt");
+    KASSERT(svc->magic == (uintptr_t)svc,
+            ("bad magic: svc %p, magic %lx", svc, svc->magic));
+    KASSERT(svc->refcnt > 0,
+            ("bad refcnt: svc %p, refcnt %d", svc, svc->refcnt));
 
     return atomic_fetchadd_int(&svc->refcnt, 1) + 1;
 }
@@ -464,22 +464,23 @@ svc_hold(struct svc *svc)
 static int
 svc_rele(struct svc *svc)
 {
-    int refcnt;
+    int rc;
 
-    KASSERT(svc->magic == svc, "invalid svc magic");
-    KASSERT(svc->refcnt > 0, "invalid svc refcnt");
+    KASSERT(svc->magic == (uintptr_t)svc,
+            ("bad magic: svc %p, magic %lx", svc, svc->magic));
+    KASSERT(svc->refcnt > 0,
+            ("bad refcnt: svc %p, refcnt %d", svc, svc->refcnt));
 
-    refcnt = atomic_fetchadd_int(&svc->refcnt, -1);
-    if (refcnt > 1)
-        return refcnt - 1;
+    rc = atomic_fetchadd_int(&svc->refcnt, -1);
+    if (rc > 1)
+        return rc - 1;
 
     tpool_shutdown(svc->tpool);
-    tpool_rele(svc->tpool);
 
     mtx_destroy(&svc->mtx);
     cv_destroy(&svc->cv);
 
-    svc->magic = NULL;
+    svc->magic = ~svc->magic;
     free(svc, M_SVC);
 
     return 0;
@@ -491,12 +492,14 @@ svc_shutdown(struct svc *svc)
     struct conn *conn, *next;
     int rc;
 
-    /* Shut down all connections and wait for them all to be destroyed.
+    /* Shut down all connections and wait for all of them to be destroyed
+     * (svc->cv will be signaled when the last connection is destroyed).
      */
     mtx_lock(&svc->mtx);
     while (!TAILQ_EMPTY(&svc->connq)) {
-        TAILQ_FOREACH_SAFE(conn, &svc->connq, entry, next)
-            soshutdown(conn->so, SHUT_RDWR);
+        TAILQ_FOREACH_SAFE(conn, &svc->connq, entry, next) {
+            soshutdown(conn->so, SHUT_RD);
+        }
 
         rc = cv_wait_sig(&svc->cv, &svc->mtx);
         if (rc && rc != EWOULDBLOCK) {
@@ -505,6 +508,9 @@ svc_shutdown(struct svc *svc)
         }
     }
 
+    /* Wait for all others actors to release their svc references
+     * (currently only connections acquire a reference).
+     */
     while (atomic_load_int(&svc->refcnt) > 1)
         cv_wait(&svc->cv, &svc->mtx);
     mtx_unlock(&svc->mtx);
@@ -528,7 +534,7 @@ svc_create(struct svc **svcp)
     TAILQ_INIT(&svc->connq);
 
     svc->refcnt = 1;
-    svc->magic = svc;
+    svc->magic = (uintptr_t)svc;
 
     svc->tpool = tpool_create(0, 8);
     if (!svc->tpool) {

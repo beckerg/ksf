@@ -24,7 +24,6 @@
  */
 
 #include <sys/param.h>
-#include <sys/limits.h>
 #include <sys/systm.h>
 #include <sys/kernel.h>
 #include <sys/kthread.h>
@@ -113,15 +112,16 @@ struct conn_priv {
     struct mbuf    *mcall;
     struct clreq   *clreq;
 
-    int     rcvlowat;
-    u_long  nrcvlowat;
-    u_long  nmisaligned;
-    u_long  pad;
+    int             rcvlowat;
+    u_long          nrcvlowat;
+    u_long          nmisaligned;
 
+    __aligned(CACHE_LINE_SIZE)
     struct mtx      txq_mtx;
     struct clhead   txq_head;
     bool            txq_active;
 
+    uintptr_t       magic;
 };
 
 static struct svc *krpc2_svc;
@@ -133,7 +133,6 @@ krpc_send(struct tpreq *tpreq)
     struct clhead todo, done;
     struct conn_priv *priv;
     struct clreq *req, *tmp;
-    struct mbuf *mreply;
     struct conn *conn;
     int sndpercb = 16;
     int refs = 0;
@@ -147,40 +146,47 @@ krpc_send(struct tpreq *tpreq)
 
     priv = conn_priv(conn);
 
+    KASSERT(priv->magic == (uintptr_t)priv,
+            ("bad magic: conn %p, priv %p, magic %lx\n",
+             conn, priv, priv->magic));
+
     mtx_lock(&priv->txq_mtx);
     STAILQ_CONCAT(&todo, &priv->txq_head);
     mtx_unlock(&priv->txq_mtx);
 
-  again:
-    mreply = NULL;
+    while (STAILQ_FIRST(&todo) && sndpercb-- > 0) {
+        struct mbuf *mreply;
 
-    while (( req = STAILQ_FIRST(&todo) )) {
+        req = STAILQ_FIRST(&todo);
         STAILQ_REMOVE_HEAD(&todo, clentry);
         STAILQ_INSERT_TAIL(&done, req, clentry);
 
-        if (mreply)
-            m_catpkt(mreply, req->mreply);
-        else
-            mreply = req->mreply;
-
+        mreply = req->mreply;
         req->mreply = NULL;
 
-        /* TODO: Restrict mreply length to available send buffer
-         * size so as to mitigate blocking in sosend().
+        /* TODO: Restrict mreply length to mitigate sosend() blocking...
          */
-        if (mreply->m_pkthdr.len > 768)
+        while (STAILQ_FIRST(&todo) && mreply->m_pkthdr.len < 768) {
+            req = STAILQ_FIRST(&todo);
+            STAILQ_REMOVE_HEAD(&todo, clentry);
+            STAILQ_INSERT_TAIL(&done, req, clentry);
+
+            m_catpkt(mreply, req->mreply);
+            req->mreply = NULL;
+        }
+
+        if (conn->shut_wr) {
+            rc = ECONNABORTED;
+            m_freem(mreply);
             break;
-    }
+        }
 
-    rc = sosend(conn->so, NULL, NULL, mreply, NULL, 0, curthread);
-    if (rc) {
-        dprint("sosend: conn %p, rc %d, %lu %lu\n",
-               conn, rc, priv->nrcvlowat, priv->nmisaligned);
-        sndpercb = 0;
+        rc = sosend(conn->so, NULL, NULL, mreply, NULL, 0, curthread);
+        if (rc) {
+            conn->shut_wr = true;
+            sndpercb = 0;
+        }
     }
-
-    if (STAILQ_FIRST(&todo) && --sndpercb > 0)
-        goto again;
 
     mtx_lock(&priv->txq_mtx);
     STAILQ_CONCAT(&todo, &priv->txq_head);
@@ -218,6 +224,10 @@ krpc_recv_rpc(struct tpreq *tpreq)
     req = container_of(tpreq, struct clreq, tpreq);
     conn = tpreq->arg;
     priv = conn_priv(conn);
+
+    KASSERT(priv->magic == (uintptr_t)priv,
+            ("bad magic: conn %p, priv %p, magic %lx\n",
+             conn, priv, priv->magic));
 
     /* Decode the incoming RPC call message...
      */
@@ -327,26 +337,18 @@ krpc_recv_tcp(struct conn *conn)
 
     priv = conn_priv(conn);
 
+    KASSERT(priv->magic == (uintptr_t)priv,
+            ("bad magic: conn %p, priv %p, magic %lx\n",
+             conn, priv, priv->magic));
+
     uio.uio_resid = IP_MAXPACKET;
     uio.uio_td = curthread;
     flags = MSG_DONTWAIT;
     m = NULL;
 
     rc = soreceive(so, NULL, &uio, &m, NULL, &flags);
-
-    if (rc || !m) {
-        if (rc != EWOULDBLOCK) {
-            if (rc) {
-                dprint("soreceive: conn %p, rc %d, m %p, flags %x, %lu %lu\n",
-                       conn, rc, m, flags, priv->nrcvlowat, priv->nmisaligned);
-            }
-
-            conn->active = false;
-            conn_rele(conn);
-        }
-
+    if (rc || !m)
         return;
-    }
 
     /* Append new data to the current record fragment.
      */
@@ -399,14 +401,17 @@ krpc_recv_tcp(struct conn *conn)
         struct tpreq *tpreq;
         struct clreq *clreq;
 
+        conn_hold(conn);
+
         clreq = priv->clreq;
         if (!clreq)
             clreq = uma_zalloc(clzone, M_WAITOK);
 
         clreq->mcall = priv->mcall;
-        priv->mcall = NULL;
+        clreq->mreply = NULL;
 
-        conn_hold(conn);
+        priv->mcall = NULL;
+        priv->clreq = NULL;
 
         tpreq = &clreq->tpreq;
         tpreq_init(tpreq, krpc_recv_rpc, conn);
@@ -438,10 +443,15 @@ krpc_accept_cb(struct conn *conn)
 {
     struct conn_priv *priv = conn_priv(conn);
 
+    KASSERT(priv->magic == 0,
+            ("bad magic: conn %p, priv %p, magic %lx\n",
+             conn, priv, priv->magic));
+
     mtx_init(&priv->txq_mtx, "rpcmtx", NULL, MTX_DEF);
     STAILQ_INIT(&priv->txq_head);
     priv->rcvlowat = RPC_RM_SZ;
     priv->clreq = uma_zalloc(clzone, M_NOWAIT);
+    priv->magic = (uintptr_t)priv;
 
     xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
 }
@@ -455,13 +465,16 @@ krpc_destroy_cb(struct conn *conn)
 {
     struct conn_priv *priv = conn_priv(conn);
 
-    KASSERT(priv->inited, "priv not initialized");
+    KASSERT(priv->magic == (uintptr_t)priv,
+            ("bad magic: conn %p, priv %p, magic %lx\n",
+             conn, priv, priv->magic));
+
+    priv->magic = ~priv->magic;
 
     uma_zfree(clzone, priv->clreq);
+    mtx_destroy(&priv->txq_mtx);
     m_freem(priv->frag);
     m_freem(priv->mcall);
-
-    mtx_destroy(&priv->txq_mtx);
 }
 
 static void
@@ -525,14 +538,12 @@ krpc2_mod_unload(module_t mod, int cmd, void *data)
     int rc;
 
     rc = svc_shutdown(krpc2_svc);
+    if (rc)
+        return rc;
 
-    dprint("%s: rc %d\n", __func__, rc);
+    krpc2_svc = NULL;
+    uma_zdestroy(clzone);
+    clzone = NULL;
 
-    if (!rc) {
-        krpc2_svc = NULL;
-        uma_zdestroy(clzone);
-        clzone = NULL;
-    }
-
-    return rc;
+    return 0;
 }

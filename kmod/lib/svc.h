@@ -31,12 +31,12 @@ typedef void conn_cb_t(struct conn *);
 
 struct conn {
     int                     refcnt;
-    bool                    active;
+    bool                    shut_wr;
     conn_cb_t              *destroy;
     struct sockaddr        *laddr;
     size_t                  privsz;
     TAILQ_ENTRY(conn)       entry;
-    void                   *magic;
+    uintptr_t               magic;
 
     __aligned(CACHE_LINE_SIZE)
     struct tpreq            tpreq;
@@ -49,19 +49,26 @@ struct conn {
     char                    priv[];
 };
 
+int conn_hold(struct conn *conn);
+void conn_reln(struct conn *conn, int n);
+
+void conn_shutdown(struct conn *conn);
+
 static inline void *
 conn_priv(struct conn *conn)
 {
     return conn->priv;
 }
 
-int conn_hold(struct conn *conn);
-void conn_rele(struct conn *conn);
-void conn_reln(struct conn *conn, int n);
+static inline void
+conn_rele(struct conn *conn)
+{
+    conn_reln(conn, 1);
+}
 
 int svc_listen(struct svc *svc, int type, const char *host, in_port_t port,
-               conn_cb_t *acceptb, conn_cb_t *recvb,
-               conn_cb_t *destroyb, size_t privsz);
+               conn_cb_t *acceptb, conn_cb_t *recvb, conn_cb_t *destroyb,
+               size_t privsz);
 int svc_create(struct svc **svcp);
 int svc_shutdown(struct svc *svc);
 

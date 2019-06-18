@@ -12,15 +12,14 @@ VPATH = ../lib
 CFLAGS	+= -DKSF_MOD=${KMOD} -DKSF_MOD_NAME=\"${KMOD}\"
 CFLAGS	+= -I../lib -I../../include
 
-#CFLAGS	+= -DINVARIANTS
-#CFLAGS	+= -DDIAGNOSTIC
+#CFLAGS	+= -DINVARIANTS -DINVARIANT_SUPPORT
 #CFLAGS	+= -O0 -g -fno-omit-frame-pointer
 
 CLEANFILES += cscope.* TAGS ${KMOD}.objdump .depend.*.o
 CSCOPE_DIRS ?= . ${VPATH} /usr/src/lib /usr/src/sys
 CTAGS = true
 
-.PHONY:	clobber cscope etags tags objdump
+.PHONY:	clobber cscope debug etags tags objdump
 
 clobber: clean
 
@@ -32,8 +31,7 @@ cscope.out: cscope.files ${HDR} ${SRC}
 cscope.files:
 	find ${CSCOPE_DIRS} -name \*.[chsSyl] -o -name \*.cpp > $@
 
-debug:
-	CFLAGS='-O0 -g -fno-omit-frame-pointer -DINVARIANTS -DDIAGNOSTIC' make all
+debug: all
 
 objdump:
 	objdump -sdwx -Mintel --prefix-addresses ${KMOD}.o > ${KMOD}.objdump

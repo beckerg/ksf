@@ -48,6 +48,7 @@ void tpool_enqueue(struct tpool *tpool, struct tpreq *req, int cpu);
 
 struct tpool *tpool_create(u_int tdmin, u_int tdmax);
 void tpool_shutdown(struct tpool *tpool);
+int tpool_hold(struct tpool *tpool);
 void tpool_rele(struct tpool *tpool);
 
 #endif /* TPOOL_H */

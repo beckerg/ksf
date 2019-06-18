@@ -98,19 +98,8 @@ kecho_recv_tcp(struct conn *conn)
 
     rc = soreceive(so, NULL, &uio, &m, NULL, &flags);
 
-    if (rc || !m) {
-        if (rc != EWOULDBLOCK) {
-            if (rc) {
-                dprint("soreceive: tcp conn %p, rc %d, m %p, flags %x\n",
-                       conn, rc, m, flags);
-            }
-
-            conn->active = false;
-            conn_rele(conn);
-        }
-
+    if (rc || !m)
         return;
-    }
 
     h = priv->hdr;
     if (!h)
@@ -119,12 +108,6 @@ kecho_recv_tcp(struct conn *conn)
     m_fixhdr(h);
 
     rc = sosend(so, NULL, NULL, h, NULL, 0, curthread);
-    if (rc) {
-        dprint("sosend: tcp conn %p, rc %d, m %p, flags %x\n",
-               conn, rc, m, flags);
-        conn->active = false;
-        conn_rele(conn);
-    }
 
     priv->hdr = m_gethdr(M_NOWAIT, MT_DATA);
 
@@ -154,19 +137,8 @@ kecho_recv_udp(struct conn *conn)
 
     rc = soreceive(so, &faddr, &uio, &m, NULL, &flags);
 
-    if (rc || !m) {
-        if (rc != EWOULDBLOCK) {
-            if (rc) {
-                dprint("soreceive: udp conn %p, rc %d, m %p, flags %x\n",
-                       conn, rc, m, flags);
-            }
-
-            conn->active = false;
-            conn_rele(conn);
-        }
-
+    if (rc || !m)
         return;
-    }
 
     h = priv->hdr;
     if (!h)
@@ -175,12 +147,6 @@ kecho_recv_udp(struct conn *conn)
     m_fixhdr(h);
 
     rc = sosend(so, faddr, NULL, h, NULL, 0, curthread);
-    if (rc) {
-        dprint("sosend: udp conn %p, rc %d, m %p, flags %x\n",
-               conn, rc, m, flags);
-        conn->active = false;
-        conn_rele(conn);
-    }
 
     free(faddr, M_SONAME);
 
@@ -206,13 +172,11 @@ kecho_mod_load(module_t mod, int cmd, void *data)
         return rc;
     }
 
-#if 1
     rc = svc_listen(svc, SOCK_DGRAM, host, port,
                     NULL, kecho_recv_udp, kecho_destroy_cb,
                     sizeof(struct conn_priv));
     if (rc)
         eprint("svc_listen() failed: udp, rc %d\n", rc);
-#endif
 
     rc = svc_listen(svc, SOCK_STREAM, host, port,
                     NULL, kecho_recv_tcp, kecho_destroy_cb,
