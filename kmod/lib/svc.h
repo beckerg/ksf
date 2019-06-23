@@ -45,14 +45,14 @@ struct conn {
     conn_cb_t              *recv;
     struct svc             *svc;
 
+    struct tpreq            tpshutdown;
+
     __aligned(CACHE_LINE_SIZE)
     char                    priv[];
 };
 
 int conn_hold(struct conn *conn);
 void conn_reln(struct conn *conn, int n);
-
-void conn_shutdown(struct conn *conn);
 
 static inline void *
 conn_priv(struct conn *conn)

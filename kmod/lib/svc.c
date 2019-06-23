@@ -92,6 +92,9 @@ conn_destroy(struct conn *conn)
     TAILQ_REMOVE(&svc->connq, conn, entry);
     mtx_unlock(&svc->mtx);
 
+    if (conn->destroy)
+        conn->destroy(conn);
+
     soclose(conn->so);
     conn->so = NULL;
 
@@ -99,16 +102,21 @@ conn_destroy(struct conn *conn)
     conn->laddr = NULL;
 
     conn->magic = ~conn->magic;
-
-    if (conn->destroy)
-        conn->destroy(conn);
-
     free(conn, M_CONN);
 
     mtx_lock(&svc->mtx);
     if (svc_rele(svc) == 1)
         cv_broadcast(&svc->cv);
     mtx_unlock(&svc->mtx);
+}
+
+static void
+conn_shutdown(struct tpreq *req)
+{
+    struct conn *conn = container_of(req, struct conn, tpshutdown);
+
+    soshutdown(conn->so, SHUT_RD);
+    conn_rele(conn);
 }
 
 int
@@ -498,7 +506,13 @@ svc_shutdown(struct svc *svc)
     mtx_lock(&svc->mtx);
     while (!TAILQ_EMPTY(&svc->connq)) {
         TAILQ_FOREACH_SAFE(conn, &svc->connq, entry, next) {
-            soshutdown(conn->so, SHUT_RD);
+            if (atomic_fetchadd_int(&conn->refcnt, 1) == 0) {
+                atomic_fetchadd_int(&conn->refcnt, -1);
+                continue;
+            }
+
+            tpreq_init(&conn->tpshutdown, conn_shutdown, NULL);
+            tpool_enqueue(conn->tpool, &conn->tpshutdown, curcpu);
         }
 
         rc = cv_wait_sig(&svc->cv, &svc->mtx);

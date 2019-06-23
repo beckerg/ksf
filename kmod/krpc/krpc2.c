@@ -542,6 +542,7 @@ krpc2_mod_unload(module_t mod, int cmd, void *data)
         return rc;
 
     krpc2_svc = NULL;
+
     uma_zdestroy(clzone);
     clzone = NULL;
 

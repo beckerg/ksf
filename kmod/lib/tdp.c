@@ -90,14 +90,12 @@ struct tpool {
     uint8_t             cpu2tgroup[MAXCPU];
 #endif
     int                 refcnt;
-    int                 cgmax;
+    int                 tgroupc;
     size_t              allocsz;
     uintptr_t           magic;
 
     struct tgroup       tgroupv[];
 };
-
-static cpuset_t tpool_cpuset;
 
 static inline struct tgroup *
 tpool_cpu2tgroup(struct tpool *tpool, int cpu)
@@ -160,7 +158,7 @@ tpool_rele(struct tpool *tpool)
     if (atomic_fetchadd_int(&tpool->refcnt, -1) > 1)
         return;
 
-    for (i = 0; i < tpool->cgmax + 1; ++i) {
+    for (i = 0; i < tpool->tgroupc + 1; ++i) {
         mtx_destroy(&tpool->tgroupv[i].mtx);
         cv_destroy(&tpool->tgroupv[i].cv);
     }
@@ -212,7 +210,7 @@ tpool_enqueue(struct tpool *tpool, struct tpreq *req, int cpu)
     mtx_unlock(&tgroup->mtx);
 
     if (req) {
-        tgroup = tpool->tgroupv + tpool->cgmax;
+        tgroup = tpool->tgroupv + tpool->tgroupc;
 
         tpool_hold(tpool);
 
@@ -236,7 +234,7 @@ tpool_shutdown(struct tpool *tpool)
 
     /* Awaken all worker threads and tell them to exit.
      */
-    for (i = 0; i < tpool->cgmax + 1; ++i) {
+    for (i = 0; i < tpool->tgroupc + 1; ++i) {
         struct tgroup *tgroup = tpool->tgroupv + i;
 
         if (tgroup->callbacks > 0)
@@ -253,7 +251,7 @@ tpool_shutdown(struct tpool *tpool)
 
     /* Wait for all worker threads to leave the run loop.
      */
-    for (i = 0; i < tpool->cgmax + 1; ++i) {
+    for (i = 0; i < tpool->tgroupc + 1; ++i) {
         struct tgroup *tgroup = tpool->tgroupv + i;
 
         mtx_lock(&tgroup->mtx);
@@ -272,6 +270,7 @@ tpool_shutdown(struct tpool *tpool)
      */
     for (i = 0; i < 5; ++i)
         tsleep(tpool, 0, "tpwait2", hz / 10);
+
     tpool_rele(tpool);
 }
 
@@ -322,13 +321,13 @@ tpool_run(void *arg)
     kthread_exit();
 }
 
-extern struct cpu_group *smp_topo(void);
 extern struct cpu_group *smp_topo_find(struct cpu_group *, int);
+extern struct cpu_group *cpu_top;
 
 struct tpool *
 tpool_create(u_int tdmin, u_int tdmax)
 {
-    struct cpu_group *cpu_top, **cgv;
+    struct cpu_group **cgv;
     struct tgroup *tgroup;
     struct tdargs *tdargs;
     struct tpool *tpool;
@@ -336,8 +335,15 @@ tpool_create(u_int tdmin, u_int tdmax)
     struct thread *td;
     struct proc *proc;
     int i, rc, width;
+    cpuset_t cpuset;
     size_t tpoolsz;
-    int cgmax;
+    int cgc;
+
+#if MAXCPU > 256
+    uint16_t cpu2tgroup[MAXCPU];
+#else
+    uint8_t cpu2tgroup[MAXCPU];
+#endif
 
     if (tdmin > 1024 || tdmax > 1024)
         return NULL;
@@ -353,37 +359,59 @@ tpool_create(u_int tdmin, u_int tdmax)
         return NULL;
     }
 
-    CPU_COPY(&set->cs_mask, &tpool_cpuset);
+    CPU_COPY(&set->cs_mask, &cpuset);
     cpuset_rel(set);
 
-    /* Count the number of cpu groups which we'll use as the number
-     * of thread groups.
-     */
-    cgmax = 0;
-    cpu_top = smp_topo();
-    CPU_FOREACH(i)
-        ++cgmax;
-
-    cgv = malloc(sizeof(*cgv) * cgmax, M_TPOOL, M_ZERO | M_WAITOK);
+    cgv = malloc(sizeof(*cgv) * mp_maxid, M_TPOOL, M_ZERO | M_WAITOK);
     if (!cgv)
         return NULL;
 
-    tpoolsz = sizeof(*tpool) + sizeof(tpool->tgroupv[0]) * (cgmax + 1);
+    /* Count the number of cpu groups (cores?) which we'll use as the
+     * number of thread groups.  For each vCPU, add an entry to the
+     * vcpu-to-thread-group map.
+     */
+    cgc = 0;
 
-    tpool = malloc(tpoolsz, M_TPOOL, M_ZERO | M_WAITOK);
-    if (!tpool) {
-        free(cgv, M_TPOOL);
-        return NULL;
+    CPU_FOREACH(i) {
+        struct cpu_group *cg;
+        int j;
+
+        if (!CPU_ISSET(i, &cpuset))
+            continue;
+
+        cg = smp_topo_find(cpu_top, i);
+        if (!cg)
+            continue;
+
+        for (j = 0; j < cgc; ++j) {
+            if (!cgv[j] || cg == cgv[j])
+                break;
+        }
+
+        cpu2tgroup[i] = j;
+
+        if (!cgv[j]) {
+            cgv[j] = cg;
+            cgc++;
+        }
     }
 
-    dprint("%s: tpool %p, %lx, %lx\n",
-           __func__, tpool, (uintptr_t)tpool & 63, (uintptr_t)tpool & 4095);
+    free(cgv, M_TPOOL);
+
+    tpoolsz = sizeof(*tpool) + sizeof(tpool->tgroupv[0]) * (cgc + 1);
+    tpoolsz = (tpoolsz + 4095) & ~4095;
+
+    tpool = malloc(tpoolsz, M_TPOOL, M_ZERO | M_WAITOK);
+    if (!tpool)
+        return NULL;
+
     tpool->refcnt = 2;
-    tpool->cgmax = cgmax;
+    tpool->tgroupc = cgc;
     tpool->allocsz = tpoolsz;
     tpool->magic = (uintptr_t)tpool;
+    memcpy(tpool->cpu2tgroup, cpu2tgroup, sizeof(tpool->cpu2tgroup));
 
-    for (i = 0; i < cgmax + 1; ++i) {
+    for (i = 0; i < cgc + 1; ++i) {
         tgroup = tpool->tgroupv + i;
 
         mtx_init(&tgroup->mtx, "wqmtx", NULL, MTX_DEF);
@@ -403,7 +431,7 @@ tpool_create(u_int tdmin, u_int tdmax)
 
         tpreq_init(&tgroup->grow, tpool_grow, NULL);
 
-        if (i == cgmax) {
+        if (i == cgc) {
             strlcpy(tdargs->name, "tpool-maint", sizeof(tdargs->name));
             tdargs->prio = PRI_MAX_KERN - 1;
             tgroup->tdmin = 1;
@@ -412,56 +440,33 @@ tpool_create(u_int tdmin, u_int tdmax)
     }
 
     /* For each vCPU, find the thread group to which it belongs
-     * and add it to the vcpu-to-thread-group map and the thead
-     * group's affinity set.
+     * and add it to the thread group's affinity set.
      */
-    for (i = 0; i < CPU_COUNT(&tpool_cpuset); ++i) {
-        struct cpu_group *cg;
-        int j;
-
-        if (!CPU_ISSET(i, &tpool_cpuset))
-            continue;
-
-        cg = smp_topo_find(cpu_top, i);
-        if (!cg)
-            continue;
-
-        for (j = 0; j < cgmax; ++j) {
-            if (!cgv[j] || cg == cgv[j])
-                break;
-        }
-
-        if (!cgv[j])
-            cgv[j] = cg;
-
-        tpool->cpu2tgroup[i] = j;
-
+    for (i = 0; i < CPU_COUNT(&cpuset); ++i) {
         tgroup = tpool_cpu2tgroup(tpool, i);
         tdargs = &tgroup->tdargs;
 
         CPU_SET(i, &tdargs->cpuset);
     }
 
-    free(cgv, M_TPOOL);
-
     /* Ensure that each thread group's affinity set is non-zero.
      */
     width = 0;
-    for (i = 0; i < cgmax + 1; ++i) {
+    for (i = 0; i < cgc + 1; ++i) {
         char buf[CPUSETBUFSIZ];
 
         tgroup = tpool->tgroupv + i;
         tdargs = &tgroup->tdargs;
 
         if (CPU_EMPTY(&tdargs->cpuset))
-            CPU_COPY(&tpool_cpuset, &tdargs->cpuset);
+            CPU_COPY(&cpuset, &tdargs->cpuset);
 
         cpusetobj_strprint(buf, &tdargs->cpuset);
         if (strlen(buf) > width)
             width = strlen(buf);
     }
 
-    for (i = 0; i < cgmax + 1; ++i) {
+    for (i = 0; i < cgc + 1; ++i) {
         char buf[CPUSETBUFSIZ];
 
         tgroup = tpool->tgroupv + i;
@@ -474,7 +479,7 @@ tpool_create(u_int tdmin, u_int tdmax)
 
     /* Start the maintenance kthread.
      */
-    tgroup = tpool->tgroupv + cgmax;
+    tgroup = tpool->tgroupv + cgc;
     tdargs = &tgroup->tdargs;
 
     rc = tpool_kthread_add(tdargs);
