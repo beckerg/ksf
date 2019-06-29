@@ -23,36 +23,8 @@
  * SUCH DAMAGE.
  */
 
-#ifndef KSF_H
-#define KSF_H
-
-/* Record marking for RPC message framing.
- */
-#define RPC_RM_SZ               (4)
-
-static inline void
-rpc_rm_get(const void *ptr, uint32_t *msglenp, bool *lastp)
-{
-    uint32_t mark;
-
-    memcpy(&mark, ptr, sizeof(mark));
-    mark = ntohl(mark);
-
-    *msglenp = mark & ~0x80000000u;
-    *lastp = mark & 0x80000000u;
-}
-
-static inline void
-rpc_rm_set(void *ptr, uint32_t msglen, bool last)
-{
-    uint32_t mark = msglen;
-
-    if (last)
-        mark |= 0x80000000u;
-
-    mark = htonl(mark);
-    memcpy(ptr, &mark, sizeof(mark));
-}
+#ifndef KNSF_H
+#define KNSF_H
 
 #ifndef ntohll
 #define ntohll(_x)      be64toh((_x))
@@ -70,6 +42,32 @@ rpc_rm_set(void *ptr, uint32_t msglen, bool last)
 #define unlikely(_x)    __builtin_expect(!!(_x), 0)
 #endif
 
+/* Record marking for RPC message framing.
+ */
+#define RPC_RECMARK_SZ  (4)
 
+static inline void
+rpc_recmark_get(const void *ptr, uint32_t *msglenp, bool *lastp)
+{
+    uint32_t mark;
 
-#endif /* KSF_H */
+    memcpy(&mark, ptr, sizeof(mark));
+    mark = ntohl(mark);
+
+    *msglenp = mark & ~0x80000000u;
+    *lastp = mark & 0x80000000u;
+}
+
+static inline void
+rpc_recmark_set(void *ptr, uint32_t msglen, bool last)
+{
+    uint32_t mark = msglen;
+
+    if (last)
+        mark |= 0x80000000u;
+
+    mark = htonl(mark);
+    memcpy(ptr, &mark, sizeof(mark));
+}
+
+#endif /* KNSF_H */

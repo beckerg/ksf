@@ -291,8 +291,8 @@ krpc_recv_rpc(struct tpreq *tpreq)
     /* Ensure the RPC record mark is in contiguous memory (this should
      * always be the case).
      */
-    if (unlikely( h->m_len < RPC_RM_SZ )) {
-        h = m_pullup(h, RPC_RM_SZ);
+    if (unlikely( h->m_len < RPC_RECMARK_SZ )) {
+        h = m_pullup(h, RPC_RECMARK_SZ);
         if (!h) {
             eprint("%s: m_pullup mark failed: xid %u\n", __func__, msg->rm_xid);
             uma_zfree(clzone, req);
@@ -303,7 +303,7 @@ krpc_recv_rpc(struct tpreq *tpreq)
 
     m_fixhdr(h);
 
-    rpc_rm_set(mtod(h, void *), h->m_pkthdr.len - RPC_RM_SZ, true);
+    rpc_recmark_set(mtod(h, void *), h->m_pkthdr.len - RPC_RECMARK_SZ, true);
     req->mreply = h;
 
     mtx_lock(&priv->txq_mtx);
@@ -359,17 +359,17 @@ krpc_recv_tcp(struct conn *conn)
 
   more:
     fraglen = m_length(priv->frag, &priv->last);
-    if (fraglen < RPC_RM_SZ)
+    if (fraglen < RPC_RECMARK_SZ)
         return;
 
     /* The record mark tells us the length of the record and whether
      * or not it's the last record in the RPC message.
      */
-    m_copydata(priv->frag, 0, RPC_RM_SZ, (caddr_t)&rm);
-    rpc_rm_get(&rm, &reclen, &reclast);
+    m_copydata(priv->frag, 0, RPC_RECMARK_SZ, (caddr_t)&rm);
+    rpc_recmark_get(&rm, &reclen, &reclast);
 
-    if (fraglen < reclen + RPC_RM_SZ) {
-        priv->rcvlowat = reclen + RPC_RM_SZ - fraglen;
+    if (fraglen < reclen + RPC_RECMARK_SZ) {
+        priv->rcvlowat = reclen + RPC_RECMARK_SZ - fraglen;
         if (priv->rcvlowat > 4096)
             priv->rcvlowat = 4096;
         xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
@@ -377,7 +377,7 @@ krpc_recv_tcp(struct conn *conn)
     }
 
     m = priv->frag;
-    m_adj(m, RPC_RM_SZ);
+    m_adj(m, RPC_RECMARK_SZ);
 
     /* We now have at least one full RPC message, so split it
      * from the ensuing data.
@@ -427,8 +427,8 @@ krpc_recv_tcp(struct conn *conn)
     if (priv->frag)
         goto more;
 
-    if (priv->rcvlowat != RPC_RM_SZ) {
-        priv->rcvlowat = RPC_RM_SZ;
+    if (priv->rcvlowat != RPC_RECMARK_SZ) {
+        priv->rcvlowat = RPC_RECMARK_SZ;
         xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
         ++priv->nrcvlowat;
     }
@@ -449,7 +449,7 @@ krpc_accept_cb(struct conn *conn)
 
     mtx_init(&priv->txq_mtx, "rpcmtx", NULL, MTX_DEF);
     STAILQ_INIT(&priv->txq_head);
-    priv->rcvlowat = RPC_RM_SZ;
+    priv->rcvlowat = RPC_RECMARK_SZ;
     priv->clreq = uma_zalloc(clzone, M_NOWAIT);
     priv->magic = (uintptr_t)priv;
 

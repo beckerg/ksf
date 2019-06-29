@@ -550,7 +550,7 @@ svc_create(struct svc **svcp)
     svc->refcnt = 1;
     svc->magic = (uintptr_t)svc;
 
-    svc->tpool = tpool_create(0, 8);
+    svc->tpool = tpool_create(1, 8);
     if (!svc->tpool) {
         svc_rele(svc);
         return ENOMEM;

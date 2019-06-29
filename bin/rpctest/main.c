@@ -159,7 +159,7 @@ rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, char *buf, size_t bufsz)
      * RPC record fragments, where the first and last fragment
      * contain just the first/last byte of the RPC message.
      */
-    offset = RPC_RM_SZ;
+    offset = RPC_RECMARK_SZ;
     if (fragged)
         offset *= 2;
 
@@ -178,21 +178,21 @@ rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, char *buf, size_t bufsz)
         if (fragged) {
             char c = buf[offset + len - 1];
 
-            rpc_rm_set(buf, 1, false);
-            buf[RPC_RM_SZ] = buf[offset];
+            rpc_recmark_set(buf, 1, false);
+            buf[RPC_RECMARK_SZ] = buf[offset];
 
-            rpc_rm_set(buf + RPC_RM_SZ + 1, len - 2, false);
+            rpc_recmark_set(buf + RPC_RECMARK_SZ + 1, len - 2, false);
 
-            rpc_rm_set(buf + offset + len - 1, 1, true);
-            buf[offset + len - 1 + RPC_RM_SZ] = c;
+            rpc_recmark_set(buf + offset + len - 1, 1, true);
+            buf[offset + len - 1 + RPC_RECMARK_SZ] = c;
 
-            len += RPC_RM_SZ * 2;
+            len += RPC_RECMARK_SZ * 2;
         }
         else {
-            rpc_rm_set(buf, len, true);
+            rpc_recmark_set(buf, len, true);
         }
 
-        len += RPC_RM_SZ;
+        len += RPC_RECMARK_SZ;
     }
 
     return len;
@@ -285,8 +285,8 @@ nullproc_async(int fd, struct tdargs *tdargs)
          * size of the record fragment.
          */
         if (rmlen == 0) {
-            cc = recv(fd, rxbuf, RPC_RM_SZ, MSG_PEEK | rxflags);
-            if (cc < RPC_RM_SZ) {
+            cc = recv(fd, rxbuf, RPC_RECMARK_SZ, MSG_PEEK | rxflags);
+            if (cc < RPC_RECMARK_SZ) {
                 if (cc > 0)
                     continue;
 
@@ -300,18 +300,18 @@ nullproc_async(int fd, struct tdargs *tdargs)
                 break;
             }
 
-            rpc_rm_get(rxbuf, &rmlen, &last);
+            rpc_recmark_get(rxbuf, &rmlen, &last);
             assert(rmlen < 1024);
 
-            rxmax = rmlen + RPC_RM_SZ;
-            rxoff = RPC_RM_SZ;
+            rxmax = rmlen + RPC_RECMARK_SZ;
+            rxoff = RPC_RECMARK_SZ;
 
             /* If we have enough RPC calls in flight then we can read
              * the record mark for reply message (n + 1) while reading
              * reply message n.
              */
             if (msgtx - msgrx > 2)
-                rxmax += RPC_RM_SZ;
+                rxmax += RPC_RECMARK_SZ;
 
             rxlen = rxmax;
         }
@@ -343,9 +343,9 @@ nullproc_async(int fd, struct tdargs *tdargs)
             XDR xdr;
 
             if (rxmax - rmlen - rxoff > 0) {
-                assert(rxmax - rmlen - rxoff == RPC_RM_SZ);
+                assert(rxmax - rmlen - rxoff == RPC_RECMARK_SZ);
 
-                rpc_rm_get(rxbuf + rmlen + rxoff, &rmlen2, &last2);
+                rpc_recmark_get(rxbuf + rmlen + rxoff, &rmlen2, &last2);
                 assert(rmlen < 1024);
 
                 if (rmlen2 == 0) {
@@ -355,7 +355,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
                 }
             }
 
-            tdargs->bytes += rmlen + RPC_RM_SZ;
+            tdargs->bytes += rmlen + RPC_RECMARK_SZ;
 
             if (last) {
                 if (rxbuf > tdargs->rxbuf) {
@@ -397,7 +397,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
             rxoff = 0;
 
             if (rmlen > 0 && (msgtx - msgrx) > 2)
-                rxmax += RPC_RM_SZ;
+                rxmax += RPC_RECMARK_SZ;
 
             rxlen = rxmax;
         }
@@ -456,9 +456,9 @@ nullproc_sync(int fd, struct tdargs *tdargs)
         /* Peek at the RPC record mark so that we can get the
          * size of the record fragment.
          */
-        cc = recv(fd, rxbuf, RPC_RM_SZ, MSG_WAITALL);
+        cc = recv(fd, rxbuf, RPC_RECMARK_SZ, MSG_WAITALL);
 
-        if (cc < RPC_RM_SZ) {
+        if (cc < RPC_RECMARK_SZ) {
             if (cc == -1) {
                 strerror_r(rc = errno, errbuf, sizeof(errbuf));
                 eprint("recv: recmark cc %ld %s\n", cc, errbuf);
@@ -470,7 +470,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
             break;
         }
 
-        rpc_rm_get(rxbuf, &rmlen, &last);
+        rpc_recmark_get(rxbuf, &rmlen, &last);
 
         cc = recv(fd, rxbuf, rmlen, MSG_WAITALL);
 
@@ -502,7 +502,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
             break;
         }
 
-        tdargs->bytes += cc + rpclen + RPC_RM_SZ;
+        tdargs->bytes += cc + rpclen + RPC_RECMARK_SZ;
         ++msgrx;
     }
 
@@ -701,8 +701,8 @@ main(int argc, char **argv)
 
     if (msgcnt < 1)
         msgcnt = 1;
-    if (msgmax < RPC_RM_SZ + 8)
-        msgmax = RPC_RM_SZ + 8;
+    if (msgmax < RPC_RECMARK_SZ + 8)
+        msgmax = RPC_RECMARK_SZ + 8;
     if (msglag > MSGLAG_MAX)
         msglag = MSGLAG_MAX;
 
