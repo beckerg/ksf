@@ -10,18 +10,16 @@ VPATH = ../lib
 .include <bsd.kmod.mk>
 
 CFLAGS	+= -DKSF_MOD=${KMOD} -DKSF_MOD_NAME=\"${KMOD}\"
-CFLAGS	+= -I../lib
-CFLAGS	+= -march=native
+CFLAGS	+= -I../lib -I../../include
 
-#CFLAGS	+= -DINVARIANTS
-#CFLAGS	+= -DDIAGNOSTIC
-#CFLAGS	+= -O0 -g
+#CFLAGS	+= -DINVARIANTS -DINVARIANT_SUPPORT
+#CFLAGS	+= -O0 -g -fno-omit-frame-pointer
 
 CLEANFILES += cscope.* TAGS ${KMOD}.objdump .depend.*.o
 CSCOPE_DIRS ?= . ${VPATH} /usr/src/lib /usr/src/sys
 CTAGS = true
 
-.PHONY:	clobber cscope etags tags objdump
+.PHONY:	clobber cscope debug etags tags objdump
 
 clobber: clean
 
@@ -32,6 +30,8 @@ cscope.out: cscope.files ${HDR} ${SRC}
 
 cscope.files:
 	find ${CSCOPE_DIRS} -name \*.[chsSyl] -o -name \*.cpp > $@
+
+debug: all
 
 objdump:
 	objdump -sdwx -Mintel --prefix-addresses ${KMOD}.o > ${KMOD}.objdump

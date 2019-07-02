@@ -66,10 +66,13 @@ For example: `sudo ./rpctest -j16 -a224 -c3000000 10.100.0.1`
 
 INTF | Gbe  |  RXQ,TXQ  |  TOE  | LATENCY | RPC/s 1T | RPC/s 16T |
 :--- | ---: | :-------: | :---: | :-----: | --------:| ---------:|
-cc0  | 100  |    8,12   |  yes  |   11.2  |  600090* |   7366830 |
-cc1  | 100  |    8,12   |   no  |   14.6  |  551400* |   4143866 |
+cc0  | 100  |    8,12   |  yes  |   11.2  |   (1)    |   7382738 |
+cc1  | 100  |    8,12   |   no  |   14.6  |   (1)    |   4143866 |
 ix0  |  10  |   12,12   |   -   |   32.8  |  630546  |   4319407 |
 igb0 |   1  |     8,8   |   -   |  125    |  566546  |   2924584 |
+
+(1) Results alternate from roughly 400000 to 60000 RPC/s between successive
+tests, need to investigate.
 
 Given that the 100Gbe and 10Gbe tests are not bandwidth limited by the NICs,
 I suspect that both latency and throughput would improve given faster CPUs
@@ -80,21 +83,26 @@ Here's a small list of hardware I could put to immediate use:
 * [Xeon Gold 6142](https://ark.intel.com/content/www/us/en/ark/products/120487/intel-xeon-gold-6142-processor-22m-cache-2-60-ghz.html)
 * [Chelsio T62100-SO-CR](https://www.chelsio.com/nic/unified-wire-adapters/t62100-so-cr/)
 * A 100Gbe switch
+* E5-2697A-v4
 * E5-2690-v4
 * E5-2687w-v2
 * E5-2667-v2
 
-The **Xeon 6142** with its 16 cores would allow me to use 16 receive queues
-on the **T62100**.
+The **Xeon 6142** and E5-2697A-v4 with their 16 cores would allow use of 16 receive
+queues on the **T62100**.
 Additional **T62100**'s would allow me to test **dual-CPU + dual-NIC**
 configurations as well as Chelsio's switchless ring topology.
 
-#### TODO
+### TODO
 1. Limit received request queuing
 2. Leverage snd soupcall to avoid blocking in sosend()
 3. Improve UDP connection handling
 4. rpctest/echotest should accept hostnames as well as dot notation
 
+### Bugs
+Unloading the **krpc2** module while their are active connections requires
+the following patch to avoid a kernel panic:
+* https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=238789
 
 ### Configuration
 

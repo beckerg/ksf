@@ -40,7 +40,7 @@
 
 static moduledata_t xx_mod;
 
-u_int xx_debug = 0;
+u_int xx_debug = 1;
 
 void
 xx_dprint(u_int lvl, const char *func, int line, const char *fmt, ...)
@@ -102,4 +102,3 @@ static moduledata_t xx_mod = {
 };
 
 DECLARE_MODULE(KSF_MOD, xx_mod, SI_SUB_EXEC, SI_ORDER_ANY);
-//MODULE_VERSION(KSF_MOD, 1);

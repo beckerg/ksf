@@ -14,9 +14,7 @@ HDR	+= clp.h
 SRC	:= main.c
 SRC	+= clp.c
 
-#LDLIBS	:= -lm -lpthread -lrt
-#LDLIBS	:= -lthr
-LDLIBS	:= -lpthread
+LDLIBS	:= -pthread
 
 VPATH	:= ../../lib
 

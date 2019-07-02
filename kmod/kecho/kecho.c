@@ -64,10 +64,24 @@ SYSCTL_UINT(_debug_kecho, OID_AUTO, debug,
 
 struct conn_priv {
     struct mbuf *hdr;
+    size_t bytes;
 };
 
+static struct svc *kecho_svc;
+
+static void
+kecho_accept_cb(struct conn *conn)
+{
+    int val = 1024 * 1024 * 2;
+    int rc;
+
+    rc = xx_sosetopt(conn->so, SO_SNDBUF, &val, sizeof(val));
+    if (rc)
+        dprint("%s: conn %p, SO_SNDBUF, rc %d\n", __func__, conn, rc);
+}
+
 /* The tcp destroy callback is called once all the references
- * to conn have been release, prior to socket close.  This
+ * to conn have been released, prior to socket close.  This
  * is where we teardown the connection private data.
  */
 static void
@@ -83,10 +97,10 @@ kecho_recv_tcp(struct conn *conn)
 {
     struct conn_priv *priv = conn_priv(conn);
     struct socket *so = conn->so;
-    struct mbuf *m = NULL;
+    struct mbuf *h, *m;
     int rcvpercall = 8;
-    struct mbuf *h;
     struct uio uio;
+    size_t len;
     int flags;
     int rc;
 
@@ -97,7 +111,6 @@ kecho_recv_tcp(struct conn *conn)
     m = NULL;
 
     rc = soreceive(so, NULL, &uio, &m, NULL, &flags);
-
     if (rc || !m)
         return;
 
@@ -107,8 +120,18 @@ kecho_recv_tcp(struct conn *conn)
     h->m_next = m;
     m_fixhdr(h);
 
-    rc = sosend(so, NULL, NULL, h, NULL, 0, curthread);
+    len = h->m_pkthdr.len;
 
+    rc = sosend(so, NULL, NULL, h, NULL, 0, curthread);
+    if (rc) {
+        dprint("%s: conn %p, len %zu, bytes %zu, %d %p\n",
+               __func__, conn, len, priv->bytes, rc, m);
+        conn->shut_wr = true;
+        priv->hdr = NULL;
+        return;
+    }
+
+    priv->bytes += len;
     priv->hdr = m_gethdr(M_NOWAIT, MT_DATA);
 
     if (--rcvpercall > 0)
@@ -156,8 +179,6 @@ kecho_recv_udp(struct conn *conn)
         goto again;
 }
 
-static struct svc *kecho_svc;
-
 int
 kecho_mod_load(module_t mod, int cmd, void *data)
 {
@@ -179,7 +200,7 @@ kecho_mod_load(module_t mod, int cmd, void *data)
         eprint("svc_listen() failed: udp, rc %d\n", rc);
 
     rc = svc_listen(svc, SOCK_STREAM, host, port,
-                    NULL, kecho_recv_tcp, kecho_destroy_cb,
+                    kecho_accept_cb, kecho_recv_tcp, kecho_destroy_cb,
                     sizeof(struct conn_priv));
     if (rc)
         eprint("svc_listen() failed: tcp, rc %d\n", rc);

@@ -142,7 +142,8 @@ test_async(int fd, struct tdargs *tdargs)
     txlen = msglen;
     rc = 0;
 
-    txfragmax = 8192;
+    txfragmax = 16 * 1024;
+    txfragmax = msglen;
     if (txfragmax > msglen)
         txfragmax = msglen;
     txfrag = txfragmax;
@@ -175,7 +176,7 @@ test_async(int fd, struct tdargs *tdargs)
             }
         }
 
-        rxflags = (msgtx - msgrx < msglag) ? MSG_DONTWAIT : 0;
+        rxflags = (msgtx < msgcnt && msgtx - msgrx < msglag) ? MSG_DONTWAIT : MSG_WAITALL;
 
         cc = recv(fd, rxbuf + (msglen - rxlen), rxlen, rxflags);
         if (cc == -1) {
@@ -217,6 +218,7 @@ test_sync(int fd, struct tdargs *tdargs)
     rc = 0;
 
     while (msgrx++ < msgcnt) {
+
         cc = send(fd, txbuf, msglen, 0);
 
         if (cc != msglen) {
@@ -283,6 +285,28 @@ run(void *arg)
         strerror_r(errno, errbuf, sizeof(errbuf));
         eprint("setsockopt(SO_RCVLOWAT): %s\n", errbuf);
         abort();
+    }
+
+    /* Make the send buffer large enough so that send() wont block..
+     */
+    if (msglen * msglag > 16 * 1024) {
+        optval = msglen * msglag;
+        rc = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &optval, sizeof(optval));
+        if (rc) {
+            strerror_r(errno, errbuf, sizeof(errbuf));
+            eprint("setsockopt(SO_SNDBUF): %s\n", errbuf);
+            abort();
+        }
+    }
+
+    if (msglen > 16 * 1024) {
+        optval = msglen * 2;
+        rc = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &optval, sizeof(optval));
+        if (rc) {
+            strerror_r(errno, errbuf, sizeof(errbuf));
+            eprint("setsockopt(SO_RCVBUF): %s\n", errbuf);
+            abort();
+        }
     }
 
     errno = 0;
