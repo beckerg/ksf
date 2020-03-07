@@ -69,7 +69,7 @@ conn_rele(struct conn *conn)
 int svc_listen(struct svc *svc, int type, const char *host, in_port_t port,
                conn_cb_t *acceptb, conn_cb_t *recvb, conn_cb_t *destroyb,
                size_t privsz);
-int svc_create(struct svc **svcp);
+int svc_create(u_int tdmin, u_int tdmax, struct svc **svcp);
 int svc_shutdown(struct svc *svc);
 
 #endif /* SVC_H */

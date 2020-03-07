@@ -59,21 +59,45 @@ MODULE_VERSION(krpc2, 1);
 
 MALLOC_DEFINE(M_XX_KRPC2, "krpc2", "krpc2 service");
 
+static int xx_sosndbuf = IP_MAXPACKET * 32;
+static int xx_sorcvbuf = IP_MAXPACKET * 16;
 static u_int xx_port = 62049;
+static u_int xx_tdmin = 1;
+static u_int xx_tdmax = 8;
 
 SYSCTL_NODE(_kern, OID_AUTO, krpc2,
             CTLFLAG_RW,
             0, "krpc2 kmod");
 
-SYSCTL_UINT(_kern_krpc2, OID_AUTO, debug,
-            CTLFLAG_RW,
-            &xx_debug, 0,
-            "Show debug tracing on console");
+SYSCTL_INT(_kern_krpc2, OID_AUTO, sosndbuf,
+           CTLFLAG_RW,
+           &xx_sosndbuf, 0,
+           "Set initial send buffer size");
+
+SYSCTL_INT(_kern_krpc2, OID_AUTO, sorcvbuf,
+           CTLFLAG_RW,
+           &xx_sorcvbuf, 0,
+           "Set initial receive buffer size");
 
 SYSCTL_UINT(_kern_krpc2, OID_AUTO, port,
             CTLFLAG_RW,
             &xx_port, 0,
             "Set listening port");
+
+SYSCTL_UINT(_kern_krpc2, OID_AUTO, tdmin,
+            CTLFLAG_RW,
+            &xx_tdmin, 0,
+            "Set threadpool minimum threads per core");
+
+SYSCTL_UINT(_kern_krpc2, OID_AUTO, tdmax,
+            CTLFLAG_RW,
+            &xx_tdmax, 0,
+            "Set threadpool maximum threads per core");
+
+SYSCTL_UINT(_kern_krpc2, OID_AUTO, debug,
+            CTLFLAG_RW,
+            &xx_debug, 0,
+            "Show debug tracing on console");
 
 struct clreq;
 STAILQ_HEAD(clhead, clreq);
@@ -442,6 +466,7 @@ static void
 krpc_accept_cb(struct conn *conn)
 {
     struct conn_priv *priv = conn_priv(conn);
+    int val, rc;
 
     KASSERT(priv->magic == 0,
             ("bad magic: conn %p, priv %p, magic %lx\n",
@@ -453,7 +478,19 @@ krpc_accept_cb(struct conn *conn)
     priv->clreq = uma_zalloc(clzone, M_NOWAIT);
     priv->magic = (uintptr_t)priv;
 
-    xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
+    rc = xx_sosetopt(conn->so, SO_RCVLOWAT, &priv->rcvlowat, sizeof(priv->rcvlowat));
+    if (rc)
+        eprint("%s: conn %p, SO_RCVLOWAT, rc %d\n", __func__, conn, rc);
+
+    val = xx_sorcvbuf;
+    rc = xx_sosetopt(conn->so, SO_RCVBUF, &val, sizeof(val));
+    if (rc)
+        eprint("%s: conn %p, SO_SNDBUF, rc %d\n", __func__, conn, rc);
+
+    val = xx_sosndbuf;
+    rc = xx_sosetopt(conn->so, SO_SNDBUF, &val, sizeof(val));
+    if (rc)
+        eprint("%s: conn %p, SO_SNDBUF, rc %d\n", __func__, conn, rc);
 }
 
 /* The tcp destroy callback is called once all the references to conn
@@ -510,7 +547,7 @@ krpc2_mod_load(module_t mod, int cmd, void *data)
     /* TODO: Provide an alternate way to start/stop services
      * so that we can avoid doing it in module load/unload.
      */
-    rc = svc_create(&svc);
+    rc = svc_create(xx_tdmin, xx_tdmax, &svc);
     if (rc) {
         eprint("svc_create() failed: %d\n", rc);
         uma_zdestroy(clzone);

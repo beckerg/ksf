@@ -53,11 +53,42 @@ MODULE_VERSION(kecho, 1);
 
 MALLOC_DEFINE(M_XX_KECHO, "kecho", "kecho service");
 
-SYSCTL_NODE(_debug, OID_AUTO, kecho,
+static int xx_sosndbuf = IP_MAXPACKET * 16;
+static int xx_sorcvbuf = IP_MAXPACKET * 8;
+static u_int xx_port = 60007;
+static u_int xx_tdmin = 1;
+static u_int xx_tdmax = 8;
+
+SYSCTL_NODE(_kern, OID_AUTO, kecho,
             CTLFLAG_RW,
             0, "kecho kmod");
 
-SYSCTL_UINT(_debug_kecho, OID_AUTO, debug,
+SYSCTL_INT(_kern_kecho, OID_AUTO, sosndbuf,
+           CTLFLAG_RW,
+           &xx_sosndbuf, 0,
+           "Set initial send buffer size");
+
+SYSCTL_INT(_kern_kecho, OID_AUTO, sorcvbuf,
+           CTLFLAG_RW,
+           &xx_sorcvbuf, 0,
+           "Set initial receive buffer size");
+
+SYSCTL_UINT(_kern_kecho, OID_AUTO, port,
+            CTLFLAG_RW,
+            &xx_port, 0,
+            "Set listening port");
+
+SYSCTL_UINT(_kern_kecho, OID_AUTO, tdmin,
+            CTLFLAG_RW,
+            &xx_tdmin, 0,
+            "Set threadpool minimum threads per core");
+
+SYSCTL_UINT(_kern_kecho, OID_AUTO, tdmax,
+            CTLFLAG_RW,
+            &xx_tdmax, 0,
+            "Set threadpool maximum threads per core");
+
+SYSCTL_UINT(_kern_kecho, OID_AUTO, debug,
             CTLFLAG_RW,
             &xx_debug, 0,
             "Show debug tracing on console");
@@ -72,12 +103,18 @@ static struct svc *kecho_svc;
 static void
 kecho_accept_cb(struct conn *conn)
 {
-    int val = 1024 * 1024 * 2;
+    int val;
     int rc;
 
+    val = IP_MAXPACKET * 8;
+    rc = xx_sosetopt(conn->so, SO_RCVBUF, &val, sizeof(val));
+    if (rc)
+        eprint("conn %p, SO_SNDBUF, rc %d\n", conn, rc);
+
+    val = IP_MAXPACKET * 16;
     rc = xx_sosetopt(conn->so, SO_SNDBUF, &val, sizeof(val));
     if (rc)
-        dprint("%s: conn %p, SO_SNDBUF, rc %d\n", __func__, conn, rc);
+        eprint("conn %p, SO_SNDBUF, rc %d\n", conn, rc);
 }
 
 /* The tcp destroy callback is called once all the references
@@ -124,8 +161,8 @@ kecho_recv_tcp(struct conn *conn)
 
     rc = sosend(so, NULL, NULL, h, NULL, 0, curthread);
     if (rc) {
-        dprint("%s: conn %p, len %zu, bytes %zu, %d %p\n",
-               __func__, conn, len, priv->bytes, rc, m);
+        dprint("conn %p, len %zu, bytes %zu, %d %p\n",
+               conn, len, priv->bytes, rc, m);
         conn->shut_wr = true;
         priv->hdr = NULL;
         return;
@@ -183,23 +220,22 @@ int
 kecho_mod_load(module_t mod, int cmd, void *data)
 {
     const char *host = "0.0.0.0";
-    in_port_t port = 60007;
     struct svc *svc;
     int rc;
 
-    rc = svc_create(&svc);
+    rc = svc_create(xx_tdmin, xx_tdmax, &svc);
     if (rc) {
         eprint("svc_create() failed: %d\n", rc);
         return rc;
     }
 
-    rc = svc_listen(svc, SOCK_DGRAM, host, port,
+    rc = svc_listen(svc, SOCK_DGRAM, host, xx_port,
                     NULL, kecho_recv_udp, kecho_destroy_cb,
                     sizeof(struct conn_priv));
     if (rc)
         eprint("svc_listen() failed: udp, rc %d\n", rc);
 
-    rc = svc_listen(svc, SOCK_STREAM, host, port,
+    rc = svc_listen(svc, SOCK_STREAM, host, xx_port,
                     kecho_accept_cb, kecho_recv_tcp, kecho_destroy_cb,
                     sizeof(struct conn_priv));
     if (rc)

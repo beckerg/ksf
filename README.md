@@ -1,12 +1,11 @@
 ## knsf - Kernel Network Service Framework for FreeBSD
 
 *knsf* is a lightweight kernel network service framework for the purpose
-of building network services that run in the FreeBSD kernel.
-The motivation behind this project was to build generally useful software
-that is able to achieve low-latency and high throughput of an RPC request
-between a client application a kernel service over various types of networks
-(as opposed to highly-specific software that sacrifices usability and
-extensiblity for optimal results).
+of building simple network services that run in the FreeBSD kernel.
+The motivation for this project was to build some generally useful RPC
+handling software that is capable of both low-latency and high throughput,
+yet does not sacrifice generality (i.e., it does not cut corners for the
+purpose of achieving better benchmarks).
 
 ### Contents
 The *knsf* repo includes two reference service implementations:
@@ -20,13 +19,13 @@ services and measure the resulting latency and throughput (*echotest* and *rpcte
 
 ### Implementation
 #### Abstractions
-*knsf* provides two primary abstractions: The connection (**struct conn**) which
-manages a single socket, and the service (**struct svc**) which manages
+*knsf* provides two primary kernel abstractions: The connection (**struct conn**)
+which manages a single socket, and the service (**struct svc**) which manages
 a collection of connections.
 
 #### Thread Pool
-*knfs* provides a thread pool for the purpose of running short-lived asynchronous
-tasks affined to a specified core.  All such tasks are executed in the context
+*knsf* provides a thread pool for the purpose of running short-lived asynchronous
+tasks affined to a specific core.  All such tasks are executed in the context
 of a kernel thread.
 
 ### Hardware
@@ -55,13 +54,14 @@ than one RPC request per call to both
 [sosend(9)](https://www.freebsd.org/cgi/man.cgi?query=sosend&sektion=9),
 and
 [soreceive(9)](https://www.freebsd.org/cgi/man.cgi?query=soreceive&sektion=9).
-Measurements taken by *rpctest* include the full time to encode each RPC call
-and decode/verify each RPC reply.
+Measurements taken by *rpctest* are end-to-end and include the full time
+to encode each RPC call and decode/verify each RPC reply.
 
 * Latency is meausred in microseconds, single-threaded (1T) with 1 inflight request.
 For example: `sudo ./rpctest -j1 10.100.0.1`
 
-* Throughput is measured in RPC/sec, multi-threaded (16T) with up to 224 inflight requests.
+* Throughput is measured in RPC/sec, multi-threaded (16T) with up to 224 inflight
+requests.
 For example: `sudo ./rpctest -j16 -a224 -c3000000 10.100.0.1`
 
 INTF | Gbe  |  RXQ,TXQ  |  TOE  | LATENCY | RPC/s 1T | RPC/s 16T |
@@ -78,18 +78,17 @@ Given that the 100Gbe and 10Gbe tests are not bandwidth limited by the NICs,
 I suspect that both latency and throughput would improve given faster CPUs
 with more cores, respectively.  To that end I would graciously accept donations
 of newer more capable hardware to further this development and test effort.
-Here's a small list of hardware I could put to immediate use:
+Here is a short list of hardware I could put to immediate use:
 
 * [Xeon Gold 6142](https://ark.intel.com/content/www/us/en/ark/products/120487/intel-xeon-gold-6142-processor-22m-cache-2-60-ghz.html)
 * [Chelsio T62100-SO-CR](https://www.chelsio.com/nic/unified-wire-adapters/t62100-so-cr/)
 * A 100Gbe switch
-* E5-2697A-v4
-* E5-2690-v4
-* E5-2687w-v2
-* E5-2667-v2
+* E5-2697A-v4 E5-2690-v4 E5-2689-v4
+* E5-2697-v3 E5-2690-v3
+* E5-2687w-v2 E5-2667-v2
 
-The **Xeon 6142** and E5-2697A-v4 with their 16 cores would allow use of 16 receive
-queues on the **T62100**.
+The **Xeon 6142** and E5-2697A-v4 with their 16 cores would allow clean use
+of 16 receive queues on the **T62100**.
 Additional **T62100**'s would allow me to test **dual-CPU + dual-NIC**
 configurations as well as Chelsio's switchless ring topology.
 
@@ -98,10 +97,13 @@ configurations as well as Chelsio's switchless ring topology.
 2. Leverage snd soupcall to avoid blocking in sosend()
 3. Improve UDP connection handling
 4. rpctest/echotest should accept hostnames as well as dot notation
+5. Implement NFS getattr for a more useful real-world comparison
+6. Implement NFS read/write to facilitate throughput measurements
 
 ### Bugs
-Unloading the **krpc2** module while their are active connections requires
-the following patch to avoid a kernel panic:
+Unloading the **krpc2** module while there are active connections requires
+the following patch to avoid a kernel panic on svn versions lower than
+-r349810:
 * https://bugs.freebsd.org/bugzilla/show_bug.cgi?id=238789
 
 ### Configuration

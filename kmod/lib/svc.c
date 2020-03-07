@@ -535,7 +535,7 @@ svc_shutdown(struct svc *svc)
 }
 
 int
-svc_create(struct svc **svcp)
+svc_create(u_int tdmin, u_int tdmax, struct svc **svcp)
 {
     struct svc *svc;
 
@@ -550,7 +550,7 @@ svc_create(struct svc **svcp)
     svc->refcnt = 1;
     svc->magic = (uintptr_t)svc;
 
-    svc->tpool = tpool_create(1, 8);
+    svc->tpool = tpool_create(tdmin, tdmax);
     if (!svc->tpool) {
         svc_rele(svc);
         return ENOMEM;
