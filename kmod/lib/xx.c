@@ -40,7 +40,7 @@
 
 static moduledata_t xx_mod;
 
-u_int xx_debug = 1;
+u_int xx_debug = 0;
 
 void
 xx_dprint(u_int lvl, const char *func, int line, const char *fmt, ...)

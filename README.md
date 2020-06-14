@@ -30,17 +30,19 @@ of a kernel thread.
 
 ### Hardware
 #### Client
-* Intel(R) Xeon(R) CPU E5-2680 v2 @ 2.80GHz
+* Intel(R) Xeon(R) CPU E5-2690 v3 @ 2.60GHz (x1)
 * cc0: t6nex0 <Chelsio T62100-SO-CR> (direct wired)
 * ix0: <Intel(R) PRO/10GbE PCI-Express> (direct wired)
 * igb0: <Intel(R) PRO/1000
-* [Tyan S7055](https://tyan.com/Motherboards_S7055_S7055AGM3NR)
+* [Supermicro SYS-6028R-TRT] https://www.supermicro.com/en/products/system/2U/6028/SYS-6028R-TRT.cfm
+* X10DRi
 
 #### Server
 * Intel(R) Xeon(R) CPU E5-2690 v3 @ 2.60GHz
 * cc0: t6nex0 <Chelsio T62100-SO-CR> (direct wired)
 * ix0: <Intel(R) PRO/10GbE PCI-Express> (direct wired)
-* [Supermicro SYS-6028R-TRT](https://www.supermicro.com/products/system/2U/6028/SYS-6028R-TRT.cfm)
+* [Supermicro SYS-6028R-TRT] https://www.supermicro.com/products/system/2U/6028/SYS-6028R-TRT.cfm
+* X10DRi-T
 
 ### Results
 
@@ -61,18 +63,13 @@ to encode each RPC call and decode/verify each RPC reply.
 For example: `sudo ./rpctest -j1 10.100.0.1`
 
 * Throughput is measured in RPC/sec, multi-threaded (16T) with up to 224 inflight
-requests.
-For example: `sudo ./rpctest -j16 -a224 -c3000000 10.100.0.1`
+requests.  For exaple: `sudo ./rpctest -j12 -a224 -c3000000 10.100.0.1`
 
-INTF | Gbe  |  RXQ,TXQ  |  TOE  | LATENCY | RPC/s 1T | RPC/s 16T |
-:--- | ---: | :-------: | :---: | :-----: | --------:| ---------:|
-cc0  | 100  |    8,12   |  yes  |   11.2  |   (1)    |   7382738 |
-cc1  | 100  |    8,12   |   no  |   14.6  |   (1)    |   4143866 |
-ix0  |  10  |   12,12   |   -   |   32.8  |  630546  |   4319407 |
-igb0 |   1  |     8,8   |   -   |  125    |  566546  |   2924584 |
-
-(1) Results alternate from roughly 400000 to 60000 RPC/s between successive
-tests, need to investigate.
+INTF | Gbe  |  RXQ,TXQ  |  TOE  |   LATENCY 1T  |    RPC/s 1T   |     RPC/s 12T     |
+:--- | ---: | :-------: | :---: | :-----------: | -------------:| -----------------:|
+cc0  | 100  |    8,12   |  yes  |  10.3 - 10.7  | 92731 - 96143 | 6129372 - 6475970 |
+cc1  | 100  |    8,12   |   no  |  12.9 - 13.1  | 75629 - 76941 | 4973351 - 5461142 |
+ix0  |  10  |    -,-    |   no  |  32.7 - 32.9  | 21285 - 30509 | 5003414 - 5584970 |
 
 Given that the 100Gbe and 10Gbe tests are not bandwidth limited by the NICs,
 I suspect that both latency and throughput would improve given faster CPUs
@@ -80,12 +77,10 @@ with more cores, respectively.  To that end I would graciously accept donations
 of newer more capable hardware to further this development and test effort.
 Here is a short list of hardware I could put to immediate use:
 
-* [Xeon Gold 6142](https://ark.intel.com/content/www/us/en/ark/products/120487/intel-xeon-gold-6142-processor-22m-cache-2-60-ghz.html)
+* E5-2697A-v4 E5-2690-v4
+* E5-2698A-v3
 * [Chelsio T62100-SO-CR](https://www.chelsio.com/nic/unified-wire-adapters/t62100-so-cr/)
 * A 100Gbe switch
-* E5-2697A-v4 E5-2690-v4 E5-2689-v4
-* E5-2697-v3 E5-2690-v3
-* E5-2687w-v2 E5-2667-v2
 
 The **Xeon 6142** and E5-2697A-v4 with their 16 cores would allow clean use
 of 16 receive queues on the **T62100**.
@@ -137,6 +132,12 @@ dev.t6nex.0.toe.tx_zcopy=1
 #### /boot/loader.conf
 
 ```
+cc_htcp_load="YES"
+if_cxgbe_load="YES"
+hw.cxgbe.nofldrxq="12"
+hw.cxgbe.nofldtxq="12"
+hw.cxgbe.fl_pktshift="2"
+hw.cxgbe.autoneg=0
 hw.ix.max_interrupt_rate="62500"
 net.inet.tcp.soreceive_stream="1"
 net.isr.bindthreads="1"
@@ -144,12 +145,6 @@ net.isr.maxthreads="-1"
 net.isr.defaultqlimit="1024"
 kern.ipc.nmbufs="16777216"
 kern.ipc.nmbclusters="4194304"
-t4fw_cfg_load="YES"
-t5fw_cfg_load="YES"
-t6fw_cfg_load="YES"
-if_cxgbe_load="YES"
-hw.cxgbe.nofldrxq="12"
-hw.cxgbe.nofldtxq="12"
-hw.cxgbe.fl_pktshift="2"
 machdep.hyperthreading_allowed="0"
+
 ```

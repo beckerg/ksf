@@ -8,25 +8,14 @@
 #
 PROG	:= rpctest
 
-HDR	:= 
-HDR	+= clp.h
-
-SRC	:= main.c
-SRC	+= clp.c
+HDR	:= clp.h
+SRC	:= main.c clp.c
 
 LDLIBS	:= -pthread
-
 VPATH	:= ../../lib
 
-# Uncomment USE_TSC if you have a P-state invariant TSC that is synchronized
-# across all cores.  By default we use gettimeofday().
-#
-#CDEFS	+= -DUSE_TSC
 
-
-# You probably don't need to change anything below this line.
-
-PROG_VERSION	:= $(shell git describe --abbrev=4 --dirty --always --tags)
+PROG_VERSION	:= $(shell git describe --abbrev=8 --dirty --always --tags)
 PLATFORM	:= $(shell uname -s | tr 'a-z' 'A-Z')
 
 INCLUDE 	:= -I. -I../../lib -I../../include
@@ -37,6 +26,7 @@ ifneq ($(wildcard /usr/include/tirpc/rpc/rpc.h),)
 	CDEFS += -DHAVE_TIRPC
 	LDLIBS += -ltirpc
 endif
+
 
 CFLAGS		+= -Wall -g -O2 ${INCLUDE}
 CFLAGS		+= -march=native

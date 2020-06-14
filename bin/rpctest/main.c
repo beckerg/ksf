@@ -39,6 +39,7 @@
 #include <ctype.h>
 #include <time.h>
 #include <pthread.h>
+#include <pthread_np.h>
 #include <limits.h>
 #include <netdb.h>
 
@@ -61,16 +62,18 @@
 
 #ifdef __FreeBSD__
 #include <sys/sysctl.h>
+#include <sys/cpuset.h>
 #endif
 
 #include "main.h"
 #include "clp.h"
 #include "ksf.h"
 
+#define BKTV_MAX    (1024 * 1024 * 4u)
 #define MSGLAG_MAX  (1024)
 #define NFS3_NULL   (0)
 
-#define rdtsc()     __builtin_ia32_rdtsd()
+#define rdtsc()     __rdtsc()
 
 char version[] = PROG_VERSION;
 char *progname;
@@ -87,6 +90,8 @@ long duration = 600;
 u_long msgcnt = 1000000;
 size_t msgmax = 128 * 1024;
 size_t msglag = 1;
+u_int itermax = UINT_MAX;
+bool headers = true;
 bool fragged = false;
 enum_t auth_flavor;
 char *auth_type = "none";
@@ -97,16 +102,17 @@ uint64_t tsc_freq = 1000000;
 
 struct tdargs {
     struct sockaddr_in faddr;
+    cpuset_t mask;
     pthread_t td;
     char *rxbuf;
     size_t bytes;
     long iters;
     long usecs;
-    long cpu;
+    long ru_usecs;
     long tx_eagain;
     long rx_eagain;
-    uint64_t latency;
     uint64_t startv[MSGLAG_MAX];
+    uint bktv[BKTV_MAX];
 } __aligned(CACHE_LINE_SIZE);
 
 static clp_posparam_t posparamv[] = {
@@ -126,6 +132,8 @@ static clp_option_t optionv[] = {
     CLP_OPTION(size_t, 'a', msglag, NULL, NULL, "max number of inflight RPCs (per thread)"),
     CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "max messages to send (per thread)"),
     CLP_OPTION(bool, 'f', fragged, NULL, NULL, "break each RPC into three records"),
+    CLP_OPTION(bool, 'H', headers, NULL, NULL, "suppress headers"),
+    CLP_OPTION(u_int, 'i', itermax, NULL, NULL, "max iterations"),
     CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of threads/connections"),
     CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
 
@@ -224,8 +232,8 @@ nullproc_async(int fd, struct tdargs *tdargs)
     uint32_t rxmax, rxoff, rmlen;
     int rxflags, txflags;
     u_long msgrx, msgtx;
-    uint64_t latency;
-    uint64_t *startv;
+    uint64_t *startv, stop;
+    u_int *bktv;
     bool last;
     int rc;
 
@@ -240,7 +248,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
     last = false;
 
     startv = tdargs->startv;
-    latency = 0;
+    bktv = tdargs->bktv;
 
     txfragmax = 8192;
     txlen = 0;
@@ -248,9 +256,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
     while (msgrx < msgcnt) {
         if (msgtx < msgcnt && msgtx - msgrx < msglag) {
             if (txlen == 0) {
-#ifdef USE_TSC
                 startv[msgtx % MSGLAG_MAX] = rdtsc();
-#endif
 
                 txlen = rpc_encode(msgtx, NFS3_NULL, auth, txbuf, msgmax);
 
@@ -377,8 +383,15 @@ nullproc_async(int fd, struct tdargs *tdargs)
                     break;
                 }
 
-#ifdef USE_TSC
-                latency += rdtsc() - startv[msg.rm_xid % MSGLAG_MAX];
+                stop = rdtsc() - startv[msg.rm_xid % MSGLAG_MAX];
+
+                if (stop >= BKTV_MAX)
+                    stop = BKTV_MAX - 1;
+
+                ++bktv[stop];
+
+#ifdef DEBUG
+                assert(startv[msg.rm_xid % MSGLAG_MAX] > 0);
                 startv[msg.rm_xid % MSGLAG_MAX] = 0;
 #endif
 
@@ -403,7 +416,6 @@ nullproc_async(int fd, struct tdargs *tdargs)
         }
     }
 
-    tdargs->latency = latency;
     tdargs->iters = msgrx;
 
     return rc;
@@ -415,6 +427,8 @@ int
 nullproc_sync(int fd, struct tdargs *tdargs)
 {
     char *rxbuf, *txbuf, errbuf[128];
+    uint64_t *startv, stop;
+    u_int *bktv;
     ssize_t cc;
     long msgrx;
     int rc;
@@ -424,6 +438,9 @@ nullproc_sync(int fd, struct tdargs *tdargs)
     msgrx = 0;
     rc = 0;
 
+    startv = tdargs->startv;
+    bktv = tdargs->bktv;
+
     while (msgrx < msgcnt) {
         struct rpc_msg rmsg;
         struct rpc_err rerr;
@@ -432,6 +449,8 @@ nullproc_sync(int fd, struct tdargs *tdargs)
         int rpclen;
         bool last;
         XDR xdr;
+
+        startv[msgrx % MSGLAG_MAX] = rdtsc();
 
         rpclen = rpc_encode(msgrx, NFS3_NULL, auth, txbuf, msgmax);
         if (rpclen == -1) {
@@ -502,6 +521,13 @@ nullproc_sync(int fd, struct tdargs *tdargs)
             break;
         }
 
+        stop = rdtsc() - startv[rmsg.rm_xid % MSGLAG_MAX];
+
+        if (stop >= BKTV_MAX)
+            stop = BKTV_MAX - 1;
+
+        ++bktv[stop];
+
         tdargs->bytes += cc + rpclen + RPC_RECMARK_SZ;
         ++msgrx;
     }
@@ -521,6 +547,13 @@ run(void *arg)
     struct tdargs *tdargs = arg;
     long usecs;
     int fd, rc;
+
+    rc = pthread_setaffinity_np(tdargs->td, sizeof(tdargs->mask), &tdargs->mask);
+    if (rc) {
+        strerror_r(errno, errbuf, sizeof(errbuf));
+        eprint("pthread_setaffinity_np: %s\n", errbuf);
+        abort();
+    }
 
     fd = socket(PF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
     if (fd == -1) {
@@ -561,11 +594,11 @@ run(void *arg)
     timersub(&ru_stop.ru_utime, &ru_start.ru_utime, &ru_utime);
     timersub(&ru_stop.ru_stime, &ru_start.ru_stime, &ru_stime);
     timeradd(&ru_utime, &ru_stime, &ru_total);
-    tdargs->cpu = ru_total.tv_sec * 1000000 + ru_total.tv_usec;
+    tdargs->ru_usecs = ru_total.tv_sec * 1000000 + ru_total.tv_usec;
 
-    dprint(1, "%p, fd %2d, usecs %ld, cpu %ld %.2lf, msgs/sec %ld, bytes/sec %ld, %ld %ld\n",
+    dprint(1, "%p, fd %2d, usecs %ld, ru %ld %.2lf, msgs/sec %ld, bytes/sec %ld, %ld %ld\n",
            tdargs->td, fd, usecs,
-           tdargs->cpu, (double)tdargs->cpu / tdargs->iters,
+           tdargs->ru_usecs, (double)tdargs->ru_usecs / tdargs->iters,
            (tdargs->iters * 1000000) / usecs,
            (tdargs->bytes * 1000000) / usecs,
            tdargs->tx_eagain, tdargs->rx_eagain);
@@ -586,18 +619,27 @@ int
 main(int argc, char **argv)
 {
     char serverip[INET_ADDRSTRLEN + 1];
+    long iters, usecs, ru_usecs;
     struct sockaddr_in faddr;
-    long iters, usecs, cpu;
     struct tdargs *tdargv;
+    double nsecspercycle;
     struct hostent *hent;
     char *server, *user;
-    uint64_t latency;
     size_t tdargvsz;
     size_t rxbufsz;
     size_t bytes;
     long *prxbuf;
     char *rxbuf;
     int i;
+
+    u_int cpu_count, cpu_offset, cpu_step;
+    cpuset_t cpu_mask;
+
+    uint index99, index95, index90, index50;
+    uint pct99, pct95, pct90, pct50;
+    uint first, last, avglat;
+    int n, j, jmax;
+    long nsecs;
 
     char errbuf[128];
     char state[256];
@@ -669,7 +711,6 @@ main(int argc, char **argv)
     faddr.sin_addr.s_addr = inet_addr(serverip);
 
 
-#ifdef USE_TSC
 #ifdef __FreeBSD__
     size_t sz = sizeof(tsc_freq);
     int ival;
@@ -696,7 +737,6 @@ main(int argc, char **argv)
     dprint(1, "machedep.tsc_freq: %lu\n", tsc_freq);
 #else
 #error "Don't know how to determine the TSC frequency on this platform"
-#endif
 #endif
 
     if (msgcnt < 1)
@@ -739,7 +779,7 @@ main(int argc, char **argv)
     for (i = 0; i < rxbufsz / sizeof(*prxbuf); i += sizeof(*prxbuf))
         *prxbuf++ = (long)(rxbuf + i);
 
-    tdargvsz = roundup(sizeof(*tdargv) * jobs, 4096);
+    tdargvsz = roundup(sizeof(*tdargv) * (jobs + 1), 4096);
     tdargvsz = roundup(tdargvsz, 1024 * 1024 * 2);
 
     tdargv = mmap(NULL, tdargvsz, PROT_READ | PROT_WRITE,
@@ -763,12 +803,45 @@ main(int argc, char **argv)
         eprint("unable to set priority: %s\n", strerror(errno));
     }
 
+    rc = pthread_getaffinity_np(pthread_self(), sizeof(cpu_mask), &cpu_mask);
+    if (rc) {
+        eprint("pthread_getaffinity_np: %s\n", strerror(errno));
+        abort();
+    }
+
+  again:
+    memset(tdargv, 0, tdargvsz); // ensure tdargv is fully mapped...
+
+    cpu_count = CPU_COUNT(&cpu_mask);
+    cpu_offset = 2;
+    cpu_step = 1;
+
+    /* Find a stepping that will evenly distribute workers across cores
+     * (assumes two HT threads per core that have sequential logical CPU
+     * numbering, which isn't always true).
+     */
+    for (i = 3; i < cpu_count; ++i) {
+        if (cpu_count % i) {
+            cpu_step = i;
+            break;
+        }
+    }
+
+    /* Start worker threads...
+     */
     for (i = 0; i < jobs; ++i) {
         struct tdargs *tdargs = tdargv + i;
 
-        memset(tdargs, 0, sizeof(*tdargs));
         memcpy(&tdargs->faddr, &faddr, sizeof(tdargs->faddr));
         tdargs->rxbuf = rxbuf + roundup(msgmax, 4096) * 2 * i;
+        CPU_COPY(&cpu_mask, &tdargs->mask);
+
+        for (j = 0; j < cpu_count && jobs < cpu_count; ++j) {
+            if (CPU_ISSET((cpu_offset + cpu_step * i) % cpu_count, &cpu_mask)) {
+                CPU_SETOF((cpu_offset + cpu_step * i) % cpu_count, &tdargs->mask);
+                break;
+            }
+        }
 
         rc = pthread_create(&tdargs->td, NULL, run, tdargs);
         if (rc) {
@@ -777,8 +850,10 @@ main(int argc, char **argv)
         }
     }
 
-    latency = bytes = usecs = iters = cpu = 0;
+    bytes = usecs = iters = ru_usecs = jmax = 0;
 
+    /* Wait for all worker threads to complete...
+     */
     for (i = 0; i < jobs; ++i) {
         struct tdargs *tdargs = tdargv + i;
         void *val;
@@ -788,19 +863,90 @@ main(int argc, char **argv)
         bytes += tdargs->bytes;
         iters += tdargs->iters;
         usecs += tdargs->usecs;
-        latency += tdargs->latency;
-        cpu += tdargs->cpu;
+        ru_usecs += tdargs->ru_usecs;
+
+        /* Coalesce all per-bkt latency counts...
+         */
+        for (j = 0; j < BKTV_MAX; ++j) {
+            if (tdargs->bktv[j] > 0) {
+                tdargv[jobs].bktv[j] += tdargs->bktv[j];
+                if (j >= jmax)
+                    jmax = j + 1;
+            }
+        }
     }
 
     usecs /= jobs;
 
-    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %.1lf/%.1lf, bytes/sec %ld, cpu/msg %.2lf\n",
-           iters, usecs, cpu,
-           (iters * 1000000) / usecs,
-           (double)usecs * jobs / iters,
-           (latency * 1000000.0) / (iters * tsc_freq),
-           (bytes * 1000000) / usecs,
-           (double)cpu / iters);
+    memset(tdargv[0].bktv, 0, sizeof(tdargv[0].bktv));
+    nsecspercycle = 1000000000.0 / tsc_freq;
+
+    pct99 = pct95 = pct90 = pct50 = 0;
+    index99 = iters * .99;
+    index95 = iters * .95;
+    index90 = iters * .90;
+    index50 = iters * .50;
+    first = last = avglat = 0;
+    nsecs = n = 0;
+
+    /* Convert latency info from cycles to hundredths of usecs...
+     */
+    for (j = 0; j < jmax; ++j) {
+        if (tdargv[jobs].bktv[j] > 0) {
+            nsecs = j * nsecspercycle;
+            tdargv[0].bktv[nsecs / 100] += tdargv[jobs].bktv[j];
+        }
+    }
+
+    /* Compute percentiles...
+     */
+    for (j = 0; j < (nsecs / 100) + 1; ++j) {
+        if (tdargv[0].bktv[j] == 0)
+            continue;
+
+        avglat += tdargv[0].bktv[j] * j;
+        n += tdargv[0].bktv[j];
+        last = j;
+
+        if (pct99 == 0) {
+            if (n >= index99)
+                pct99 = j;
+
+            if (pct95 == 0) {
+                if (n >= index95)
+                    pct95 = j;
+
+                if (pct90 == 0) {
+                    if (n >= index90)
+                        pct90 = j;
+
+                    if (pct50 == 0) {
+                        if (n >= index50)
+                            pct50 = j;
+
+                        if (first == 0)
+                            first = j;
+                    }
+                }
+            }
+        }
+    }
+
+    if (headers) {
+        printf("%10s %4s %4s %9s %9s %8s %8s %6s %6s %6s %6s %6s %6s %7s %7s\n",
+               "DATE", "TDS", "INF", "MSGCNT", "DURATION", "MSG/s", "Mbps",
+               "MIN", "AVG", "50%", "90%", "95%", "99%", "MAX", "RU/MSG");
+        headers = false;
+    }
+
+    printf("%10ld %4u %4zu %9ld %9ld %8lu %8.2lf %6.1lf %6.1lf %6.1lf %6.1lf %6.1lf %6.1lf %7.1lf %7.2lf\n",
+           time(NULL), jobs, msglag, iters, usecs, (iters * 1000000) / usecs,
+           (double)bytes / usecs, first / 10.0, (avglat / n) / 10.0,
+           pct50 / 10.0, pct90 / 10.0, pct95 / 10.0, pct99 / 10.0, last / 10.0,
+           (double)ru_usecs / iters);
+
+    if (itermax-- > 1)
+        goto again;
 
     munmap(tdargv, tdargvsz);
     munmap(rxbuf, rxbufsz);
@@ -823,7 +969,7 @@ dprint_func(int lvl, const char *func, int line, const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    if (verbosity > 1)
+    if (verbosity > 2)
         fprintf(dprint_fp, "%s: %16s %4d:  %s", progname, func, line, msg);
     else
         fprintf(dprint_fp, "%s", msg);

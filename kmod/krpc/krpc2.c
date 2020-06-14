@@ -244,6 +244,7 @@ krpc_recv_rpc(struct tpreq *tpreq)
     struct conn *conn;
     struct mbuf *h;
     uint32_t mark;
+    uint32_t xid;
 
     req = container_of(tpreq, struct clreq, tpreq);
     conn = tpreq->arg;
@@ -283,9 +284,12 @@ krpc_recv_rpc(struct tpreq *tpreq)
         break;
     }
 
+    xid = msg->rm_xid;
+
     /* Encode the outgoing RPC reply message...
      */
     msg = &req->rmsg;
+    msg->rm_xid = xid;
     msg->rm_direction = REPLY;
     msg->rm_reply.rp_stat = MSG_ACCEPTED;
 
@@ -485,12 +489,12 @@ krpc_accept_cb(struct conn *conn)
     val = xx_sorcvbuf;
     rc = xx_sosetopt(conn->so, SO_RCVBUF, &val, sizeof(val));
     if (rc)
-        eprint("%s: conn %p, SO_SNDBUF, rc %d\n", __func__, conn, rc);
+        eprint("%s: conn %p, SO_SNDBUF %d, rc %d\n", __func__, conn, xx_sorcvbuf, rc);
 
     val = xx_sosndbuf;
     rc = xx_sosetopt(conn->so, SO_SNDBUF, &val, sizeof(val));
     if (rc)
-        eprint("%s: conn %p, SO_SNDBUF, rc %d\n", __func__, conn, rc);
+        eprint("%s: conn %p, SO_SNDBUF %d, rc %d\n", __func__, conn, xx_sosndbuf, rc);
 }
 
 /* The tcp destroy callback is called once all the references to conn
