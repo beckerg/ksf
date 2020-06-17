@@ -2,10 +2,6 @@
 #
 # $Id: GNUmakefile 393 2016-04-14 09:21:59Z greg $
 
-
-# The only variables you might need to change in this makefile are:
-# PROG, SRC, HDR, LDLIBS, and VPATH.
-#
 PROG	:= rpctest
 
 HDR	:= clp.h
@@ -27,7 +23,6 @@ ifneq ($(wildcard /usr/include/tirpc/rpc/rpc.h),)
 	LDLIBS += -ltirpc
 endif
 
-
 CFLAGS		+= -Wall -g -O2 ${INCLUDE}
 CFLAGS		+= -march=native
 DEBUG		:= -O0 -DDEBUG -UNDEBUG -fno-omit-frame-pointer
@@ -48,7 +43,7 @@ CSCOPE_EXCLUDE	?= '^/usr/src/sys/(arm|i386|ia64|mips|powerpc|sparc64|sun4v|pc98|
 #
 .DELETE_ON_ERROR:
 
-.PHONY:	all asan clean clobber cscope debug etags tags
+.PHONY:	all asan clean clobber cscope debug distclean etags maintainer-clean tags
 
 
 all: ${PROG}
@@ -62,7 +57,7 @@ clean:
 	rm -f ${PROG} ${OBJ} *.core
 	rm -f $(patsubst %.c,.%.d,${SRC})
 
-cleandir clobber distclean: clean
+cleandir clobber distclean maintainer-clean: clean
 	rm -f cscope.files cscope*.out TAGS
 
 cscope: cscope.out

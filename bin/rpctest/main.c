@@ -73,7 +73,13 @@
 #define MSGLAG_MAX  (1024)
 #define NFS3_NULL   (0)
 
-#define rdtsc()     __rdtsc()
+#ifndef __read_mostly
+#define __read_mostly       __attribute__((__section__(".read_mostly")))
+#endif
+
+#ifndef likely
+#define likely(_expr)       __builtin_expect(!!(_expr), 1)
+#endif
 
 char version[] = PROG_VERSION;
 char *progname;
@@ -84,21 +90,23 @@ FILE *eprint_fp;
 
 pthread_barrier_t bar_start;
 pthread_barrier_t bar_end;
-unsigned int jobs = 1;
-in_port_t port = 62049;
-long duration = 600;
-u_long msgcnt = 1000000;
 size_t msgmax = 128 * 1024;
-size_t msglag = 1;
+long duration = 600;
 u_int itermax = UINT_MAX;
+u_int jobs = 1;
 bool headers = true;
 bool fragged = false;
+in_port_t port = 62049;
 enum_t auth_flavor;
 char *auth_type = "none";
 AUTH *auth;
 char *host;
 bool udp;
-uint64_t tsc_freq = 1000000;
+
+u_long msgcnt __read_mostly;
+size_t msglag __read_mostly;
+bool have_tsc __read_mostly;
+uint64_t tsc_freq __read_mostly;
 
 struct tdargs {
     struct sockaddr_in faddr;
@@ -135,10 +143,24 @@ static clp_option_t optionv[] = {
     CLP_OPTION(bool, 'H', headers, NULL, NULL, "suppress headers"),
     CLP_OPTION(u_int, 'i', itermax, NULL, NULL, "max iterations"),
     CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of threads/connections"),
+    CLP_OPTION(bool, 'T', have_tsc, NULL, NULL, "do not use TSC"),
     CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
 
     CLP_OPTION_END
 };
+
+static inline uint64_t
+rdtsc(void)
+{
+    struct timeval tv;
+
+    if (likely(have_tsc))
+        return __rdtsc();
+
+    gettimeofday(&tv, NULL);
+
+    return (tv.tv_sec * 1000000 + tv.tv_usec);
+}
 
 int
 rpc_encode(uint32_t xid, uint32_t proc, AUTH *auth, char *buf, size_t bufsz)
@@ -596,7 +618,7 @@ run(void *arg)
     timeradd(&ru_utime, &ru_stime, &ru_total);
     tdargs->ru_usecs = ru_total.tv_sec * 1000000 + ru_total.tv_usec;
 
-    dprint(1, "%p, fd %2d, usecs %ld, ru %ld %.2lf, msgs/sec %ld, bytes/sec %ld, %ld %ld\n",
+    dprint(2, "%p, fd %2d, usecs %ld, ru %ld %.2lf, msgs/sec %ld, bytes/sec %ld, %ld %ld\n",
            tdargs->td, fd, usecs,
            tdargs->ru_usecs, (double)tdargs->ru_usecs / tdargs->iters,
            (tdargs->iters * 1000000) / usecs,
@@ -630,6 +652,7 @@ main(int argc, char **argv)
     size_t bytes;
     long *prxbuf;
     char *rxbuf;
+    int flags;
     int i;
 
     u_int cpu_count, cpu_offset, cpu_step;
@@ -650,10 +673,33 @@ main(int argc, char **argv)
     progname = strrchr(argv[0], '/');
     progname = (progname ? progname + 1 : argv[0]);
 
+    initstate((u_long)time(NULL), state, sizeof(state));
     dprint_fp = stderr;
     eprint_fp = stderr;
+    have_tsc = false;
+    msgcnt = 1000000;
+    msglag = 1;
 
-    initstate((u_long)time(NULL), state, sizeof(state));
+#ifdef __FreeBSD__
+    uint64_t val = 0;
+    size_t valsz = sizeof(val);
+
+    rc = sysctlbyname("kern.timecounter.smp_tsc", (void *)&val, &valsz, NULL, 0);
+    if (rc) {
+        eprint("sysctlbyname(kern.timecounter.smp_tsc): %s\n", strerror(errno));
+    } else if (val) {
+        valsz = sizeof(val);
+        val = 0;
+
+        rc = sysctlbyname("machdep.tsc_freq", (void *)&val, &valsz, NULL, 0);
+        if (rc) {
+            eprint("sysctlbyname(machdep.tsc_freq): %s\n", strerror(errno));
+        } else {
+            have_tsc = true;
+            tsc_freq = val;
+        }
+    }
+#endif
 
     rc = clp_parsev(argc, argv, optionv, posparamv, errbuf, sizeof(errbuf), &optind);
     if (rc) {
@@ -663,6 +709,10 @@ main(int argc, char **argv)
 
     if (given('h') || given('V'))
         return 0;
+
+    if (!have_tsc)
+        tsc_freq = 1000000;
+    dprint(1, "have_tsc %d, tsc_freq %lu\n", have_tsc, tsc_freq);
 
     argc -= optind;
     argv += optind;
@@ -710,35 +760,6 @@ main(int argc, char **argv)
     serverip[sizeof(serverip) - 1] = '\000';
     faddr.sin_addr.s_addr = inet_addr(serverip);
 
-
-#ifdef __FreeBSD__
-    size_t sz = sizeof(tsc_freq);
-    int ival;
-
-    sz = sizeof(ival);
-    rc = sysctlbyname("kern.timecounter.smp_tsc", (void *)&ival, &sz, NULL, 0);
-    if (rc) {
-        eprint("sysctlbyname(kern.timecounter.smp_tsc): %s\n", strerror(errno));
-        exit(EX_OSERR);
-    }
-
-    if (!ival) {
-        dprint(0, "unable to determine if the TSC is SMP safe, "
-               "output will likely be incorrect\n");
-    }
-
-    sz = sizeof(tsc_freq);
-    rc = sysctlbyname("machdep.tsc_freq", (void *)&tsc_freq, &sz, NULL, 0);
-    if (rc) {
-        eprint("sysctlbyname(machdep.tsc_freq): %s\n", strerror(errno));
-        exit(EX_OSERR);
-    }
-
-    dprint(1, "machedep.tsc_freq: %lu\n", tsc_freq);
-#else
-#error "Don't know how to determine the TSC frequency on this platform"
-#endif
-
     if (msgcnt < 1)
         msgcnt = 1;
     if (msgmax < RPC_RECMARK_SZ + 8)
@@ -749,8 +770,13 @@ main(int argc, char **argv)
     rxbufsz = roundup(msgmax, 4096) * 2 * jobs;
     rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);
 
-    rxbuf = mmap(NULL, rxbufsz, PROT_READ | PROT_WRITE,
-                 MAP_ALIGNED_SUPER | MAP_SHARED | MAP_ANON, -1, 0);
+    flags = MAP_SHARED | MAP_ANON;
+
+#ifdef __FreeBSD__
+    flags |= MAP_ALIGNED_SUPER;
+#endif
+
+    rxbuf = mmap(NULL, rxbufsz, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (rxbuf == MAP_FAILED) {
         strerror_r(errno, errbuf, sizeof(errbuf));
         eprint("mmap: %s\n", errbuf);
@@ -772,7 +798,7 @@ main(int argc, char **argv)
     }
 
     rc = rpc_encode(msgcnt, NFS3_NULL, auth, rxbuf, rxbufsz);
-    dprint(1, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, sizeof(nfsv3_null auth%s) %d\n",
+    dprint(1, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, authtype auth%s, rc %d\n",
            sizeof(struct rpc_msg), sizeof(struct call_body), auth_type, rc);
 
     prxbuf = (long *)rxbuf;
