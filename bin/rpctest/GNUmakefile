@@ -42,6 +42,7 @@ CSCOPE_EXCLUDE	?= '^/usr/src/sys/(arm|i386|ia64|mips|powerpc|sparc64|sun4v|pc98|
 # Always delete partially built targets.
 #
 .DELETE_ON_ERROR:
+.NOTPARALLEL:
 
 .PHONY:	all asan clean clobber cscope debug distclean etags maintainer-clean tags
 

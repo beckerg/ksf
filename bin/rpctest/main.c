@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2001-2006,2011,2014-2017,2019 Greg Becker.  All rights reserved.
+ * Copyright (c) 2001-2006,2011,2014-2017,2019-2020 Greg Becker.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -23,6 +23,10 @@
  * SUCH DAMAGE.
  */
 
+#if __linux__
+#define _GNU_SOURCE
+#endif
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -39,7 +43,6 @@
 #include <ctype.h>
 #include <time.h>
 #include <pthread.h>
-#include <pthread_np.h>
 #include <limits.h>
 #include <netdb.h>
 
@@ -53,25 +56,40 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
-#include <sys/endian.h>
 
 #include <rpc/types.h>
 #include <rpc/auth.h>
 #include <rpc/rpc.h>
-#include <rpcsvc/nfs_prot.h>
 
-#ifdef __FreeBSD__
+#if __FreeBSD__
+#include <pthread_np.h>
+#include <sys/endian.h>
+#include <rpcsvc/nfs_prot.h>
 #include <sys/sysctl.h>
 #include <sys/cpuset.h>
+
+#elif __linux__
+
+#include <sched.h>
+#include <endian.h>
+#include <linux/nfs.h>
+
+#define MAP_ALIGNED_SUPER   MAP_HUGETLB
+#define CACHE_LINE_SIZE     (64)
+#define cpuset_t            cpu_set_t
+
+#define CPU_COPY(_src, _dst)        \
+do {                                \
+    CPU_ZERO((_dst));               \
+    CPU_OR((_dst), (_src), (_src)); \
+} while (0)
+
 #endif
 
-#include "main.h"
-#include "clp.h"
-#include "ksf.h"
-
-#define BKTV_MAX    (1024 * 1024 * 4u)
-#define MSGLAG_MAX  (1024)
-#define NFS3_NULL   (0)
+#define SPALIGN         (1024 * 1024 * 2ul) // Superpage alignment
+#define BKTV_MAX        (1024 * 1024 * 4u)
+#define MSGLAG_MAX      (1024)
+#define NFS3_NULL       (0)
 
 #ifndef __read_mostly
 #define __read_mostly       __attribute__((__section__(".read_mostly")))
@@ -80,6 +98,14 @@
 #ifndef likely
 #define likely(_expr)       __builtin_expect(!!(_expr), 1)
 #endif
+
+#ifndef __aligned
+#define __aligned(_sz)      __attribute__((__aligned__(_sz)))
+#endif
+
+#include "main.h"
+#include "clp.h"
+#include "ksf.h"
 
 char version[] = PROG_VERSION;
 char *progname;
@@ -149,17 +175,65 @@ static clp_option_t optionv[] = {
     CLP_OPTION_END
 };
 
+#if __linux__ && __amd64__
+static inline uint64_t
+__rdtsc(void)
+{
+    uint32_t low, high;
+
+    __asm __volatile("rdtsc" : "=a" (low), "=d" (high));
+
+    return (low | ((u_int64_t)high << 32));
+}
+#endif
+
 static inline uint64_t
 rdtsc(void)
 {
     struct timeval tv;
 
+#if __amd64__
     if (likely(have_tsc))
         return __rdtsc();
+#endif
 
     gettimeofday(&tv, NULL);
 
     return (tv.tv_sec * 1000000 + tv.tv_usec);
+}
+
+/* Allocate one or more superpages...
+ */
+void *
+spalloc(size_t sz)
+{
+    int flags = MAP_SHARED | MAP_ANON;
+    int prot = PROT_READ | PROT_WRITE;
+    int super = MAP_ALIGNED_SUPER;
+    void *mem;
+
+    if (sz & (SPALIGN - 1))
+        return NULL;
+
+  again:
+    mem = mmap(NULL, sz, prot, flags, -1, 0);
+
+    if (mem == MAP_FAILED) {
+        if (super) {
+            super = 0;
+            goto again;
+        }
+    }
+
+    return (mem == MAP_FAILED) ? NULL : mem;
+}
+
+int
+spfree(void *mem, size_t sz)
+{
+    assert(mem && !((uintptr_t)mem & (SPALIGN - 1)) && !(sz & (SPALIGN - 1)));
+
+    return munmap(mem, sz);
 }
 
 int
@@ -249,7 +323,7 @@ rpc_decode(XDR *xdr, struct rpc_msg *msg, struct rpc_err *err)
 int
 nullproc_async(int fd, struct tdargs *tdargs)
 {
-    char *rxbuf, *txbuf, errbuf[128];
+    char *rxbuf, *txbuf;
     ssize_t rxlen, txlen, txfrag, txfragmax, cc;
     uint32_t rxmax, rxoff, rmlen;
     int rxflags, txflags;
@@ -291,8 +365,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
             cc = send(fd, txbuf + (txfragmax - txfrag), txfrag, txflags);
             if (cc == -1) {
                 if (errno != EAGAIN) {
-                    strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                    eprint("send: cc %ld: %s\n", cc, errbuf);
+                    eprint(rc = errno, "send: cc %ld", cc);
                     break;
                 }
 
@@ -323,8 +396,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
                     continue;
                 }
 
-                strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("recv: cc %ld %s\n", cc, errbuf);
+                eprint(rc = errno, "recv: cc %ld", cc);
                 break;
             }
 
@@ -356,8 +428,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
                 continue;
             }
 
-            strerror_r(rc = errno, errbuf, sizeof(errbuf));
-            eprint("recv: cc %ld %s\n", cc, errbuf);
+            eprint(rc = errno, "recv: cc %ld", cc);
             break;
         }
 
@@ -377,7 +448,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
                 assert(rmlen < 1024);
 
                 if (rmlen2 == 0) {
-                    eprint("invalid record mark: %ld %u %u %u %u %lu %lu\n",
+                    eprint(0, "invalid record mark: %ld %u %u %u %u %lu %lu",
                            rxlen, rxmax, rmlen, rxoff, rmlen2, msgrx, msgtx);
                     break;
                 }
@@ -399,7 +470,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
                 stat = rpc_decode(&xdr, &msg, &err);
 
                 if (stat != RPC_SUCCESS) {
-                    eprint("invalid rpc reply: %ld %u %u %u %u %lu %lu %u: %s\n",
+                    eprint(0, "invalid rpc reply: %ld %u %u %u %u %lu %lu %u: %s",
                            rxlen, rxmax, rmlen, rxoff, rmlen2, msgrx, msgtx, stat,
                            clnt_sperrno(stat));
                     break;
@@ -448,8 +519,8 @@ nullproc_async(int fd, struct tdargs *tdargs)
 int
 nullproc_sync(int fd, struct tdargs *tdargs)
 {
-    char *rxbuf, *txbuf, errbuf[128];
     uint64_t *startv, stop;
+    char *rxbuf, *txbuf;
     u_int *bktv;
     ssize_t cc;
     long msgrx;
@@ -476,7 +547,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
 
         rpclen = rpc_encode(msgrx, NFS3_NULL, auth, txbuf, msgmax);
         if (rpclen == -1) {
-            eprint("rpc_encode: len %d, msgrx %ld\n", rpclen, msgrx);
+            eprint(0, "rpc_encode: len %d, msgrx %ld", rpclen, msgrx);
             abort();
         }
 
@@ -484,12 +555,11 @@ nullproc_sync(int fd, struct tdargs *tdargs)
 
         if (cc != rpclen) {
             if (cc == -1) {
-                strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("send: cc %ld: %s\n", cc, errbuf);
+                eprint(rc = errno, "send: cc %ld", cc);
                 break;
             }
 
-            eprint("send: cc %ld: short write\n", cc);
+            eprint(0, "send: cc %ld: short write", cc);
             rc = EIO;
             break;
         }
@@ -501,12 +571,11 @@ nullproc_sync(int fd, struct tdargs *tdargs)
 
         if (cc < RPC_RECMARK_SZ) {
             if (cc == -1) {
-                strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("recv: recmark cc %ld %s\n", cc, errbuf);
+                eprint(rc = errno, "recv: recmark cc %ld", cc);
                 break;
             }
 
-            eprint("recv: recmark cc %ld short read\n", cc);
+            eprint(0, "recv: recmark cc %ld short read", cc);
             rc = EIO;
             break;
         }
@@ -517,14 +586,11 @@ nullproc_sync(int fd, struct tdargs *tdargs)
 
         if (cc != rmlen) {
             if (cc == -1) {
-                strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("recv: cc %ld, expected %u: %s\n",
-                       cc, rmlen, errbuf);
+                eprint(rc = errno, "recv: cc %ld, expected %u", cc, rmlen);
                 break;
             }
 
-            eprint("recv: cc %ld short read, expected %u\n",
-                   cc, rmlen);
+            eprint(0, "recv: cc %ld short read, expected %u", cc, rmlen);
             rc = EIO;
             break;
         }
@@ -534,12 +600,12 @@ nullproc_sync(int fd, struct tdargs *tdargs)
         stat = rpc_decode(&xdr, &rmsg, &rerr);
 
         if (stat != RPC_SUCCESS) {
-            eprint("recv: msgrx %ld, stat %d\n", msgrx, stat);
+            eprint(0, "recv: msgrx %ld, stat %d", msgrx, stat);
             break;
         }
 
         if (rmsg.rm_xid != msgrx) {
-            eprint("recv: invalid xid %u, msgrx %ld\n", rmsg.rm_xid, msgrx);
+            eprint(0, "recv: invalid xid %u, msgrx %ld", rmsg.rm_xid, msgrx);
             break;
         }
 
@@ -562,7 +628,6 @@ nullproc_sync(int fd, struct tdargs *tdargs)
 void *
 run(void *arg)
 {
-    char errbuf[128];
     struct timeval tv_start, tv_stop, tv_diff;
     struct timeval ru_utime, ru_stime, ru_total;
     struct rusage ru_start, ru_stop;
@@ -570,26 +635,34 @@ run(void *arg)
     long usecs;
     int fd, rc;
 
+#if __FreeBSD__
     rc = pthread_setaffinity_np(tdargs->td, sizeof(tdargs->mask), &tdargs->mask);
     if (rc) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("pthread_setaffinity_np: %s\n", errbuf);
+        eprint(errno, "pthread_setaffinity_np");
         abort();
     }
+#endif
+
+    /* Reschedule to ensure are running on the desired CPU...
+     */
+    usleep(10000);
 
     fd = socket(PF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
     if (fd == -1) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("socket: %s\n", errbuf);
+        eprint(errno, "socket");
         abort();
     }
 
     rc = connect(fd, (struct sockaddr *)&tdargs->faddr, sizeof(tdargs->faddr));
     if (rc) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("connect: %s\n", errbuf);
+        eprint(errno, "connect");
         abort();
     }
+
+    /* It's not necessary to zero the startv[] array, but this may
+     * well serve to kick to the cpu into turbo boost...
+     */
+    memset(tdargs->startv, 0, sizeof(tdargs->startv));
 
     errno = 0;
     rc = pthread_barrier_wait(&bar_start);
@@ -619,7 +692,7 @@ run(void *arg)
     tdargs->ru_usecs = ru_total.tv_sec * 1000000 + ru_total.tv_usec;
 
     dprint(2, "%p, fd %2d, usecs %ld, ru %ld %.2lf, msgs/sec %ld, bytes/sec %ld, %ld %ld\n",
-           tdargs->td, fd, usecs,
+           (void *)tdargs->td, fd, usecs,
            tdargs->ru_usecs, (double)tdargs->ru_usecs / tdargs->iters,
            (tdargs->iters * 1000000) / usecs,
            (tdargs->bytes * 1000000) / usecs,
@@ -652,14 +725,13 @@ main(int argc, char **argv)
     size_t bytes;
     long *prxbuf;
     char *rxbuf;
-    int flags;
     int i;
 
-    u_int cpu_count, cpu_offset, cpu_step;
+    int cpu_count, cpu_offset, cpu_step;
     cpuset_t cpu_mask;
 
-    uint index99, index95, index90, index50;
-    uint pct99, pct95, pct90, pct50;
+    uint index99, index90, index50, index10, index1;
+    uint pct99, pct90, pct50, pct10, pct1;
     uint first, last, avglat;
     int n, j, jmax;
     long nsecs;
@@ -676,42 +748,56 @@ main(int argc, char **argv)
     initstate((u_long)time(NULL), state, sizeof(state));
     dprint_fp = stderr;
     eprint_fp = stderr;
+    tsc_freq = 1000000;
     have_tsc = false;
     msgcnt = 1000000;
     msglag = 1;
 
-#ifdef __FreeBSD__
+#if __amd64__
+#if __FreeBSD__
     uint64_t val = 0;
     size_t valsz = sizeof(val);
 
     rc = sysctlbyname("kern.timecounter.smp_tsc", (void *)&val, &valsz, NULL, 0);
     if (rc) {
-        eprint("sysctlbyname(kern.timecounter.smp_tsc): %s\n", strerror(errno));
+        eprint(errno, "sysctlbyname(kern.timecounter.smp_tsc)");
     } else if (val) {
         valsz = sizeof(val);
         val = 0;
 
         rc = sysctlbyname("machdep.tsc_freq", (void *)&val, &valsz, NULL, 0);
         if (rc) {
-            eprint("sysctlbyname(machdep.tsc_freq): %s\n", strerror(errno));
+            eprint(errno, "sysctlbyname(machdep.tsc_freq)");
         } else {
             have_tsc = true;
             tsc_freq = val;
         }
     }
+#elif __linux__
+    const char cmd[] = "lscpu | sed -En 's/^Model name.*([0-9]\\.[0-9][0-9])GHz$/\\1/p'";
+    char buf[32];
+    FILE *fp;
+
+    fp = popen(cmd, "r");
+    if (fp) {
+        if (fgets(buf, sizeof(buf), fp)) {
+            tsc_freq = strtod(buf, NULL) * 1000000000;
+            have_tsc = true;
+        }
+        pclose(fp);
+    }
+#endif
 #endif
 
     rc = clp_parsev(argc, argv, optionv, posparamv, errbuf, sizeof(errbuf), &optind);
     if (rc) {
-        eprint("%s\n", errbuf);
+        eprint(0, "%s", errbuf);
         exit(rc);
     }
 
     if (given('h') || given('V'))
         return 0;
 
-    if (!have_tsc)
-        tsc_freq = 1000000;
     dprint(1, "have_tsc %d, tsc_freq %lu\n", have_tsc, tsc_freq);
 
     argc -= optind;
@@ -732,7 +818,7 @@ main(int argc, char **argv)
     }
 
     if (!isalpha(server[0]) && !isdigit(server[0])) {
-        eprint("invalid host name %s\n", server);
+        eprint(0, "invalid host name %s", server);
         exit(1);
     }
 
@@ -741,19 +827,19 @@ main(int argc, char **argv)
 
     hent = gethostbyname(server);
     if (!hent) {
-        eprint("gethostbyname(%s) failed: %s\n", server, hstrerror(h_errno));
+        eprint(0, "gethostbyname(%s) failed: %s", server, hstrerror(h_errno));
         exit(1);
     }
 
     if (hent->h_addrtype != AF_INET) {
-        eprint("host %s does not have an AF_INET address\n", server);
+        eprint(0, "host %s does not have an AF_INET address", server);
         exit(1);
     }
 
     if (!inet_ntop(AF_INET, hent->h_addr_list[0],
                    serverip, sizeof(serverip))) {
-        eprint("unable to convert server address %s to dotted quad notation: %s",
-               server, strerror(errno));
+        eprint(errno, "unable to convert server address %s to dotted quad notation",
+               server);
         exit(1);
     }
 
@@ -770,16 +856,9 @@ main(int argc, char **argv)
     rxbufsz = roundup(msgmax, 4096) * 2 * jobs;
     rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);
 
-    flags = MAP_SHARED | MAP_ANON;
-
-#ifdef __FreeBSD__
-    flags |= MAP_ALIGNED_SUPER;
-#endif
-
-    rxbuf = mmap(NULL, rxbufsz, PROT_READ | PROT_WRITE, flags, -1, 0);
-    if (rxbuf == MAP_FAILED) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("mmap: %s\n", errbuf);
+    rxbuf = spalloc(rxbufsz);
+    if (!rxbuf) {
+        eprint(errno, "mmap rxbuf");
         abort();
     }
 
@@ -793,7 +872,7 @@ main(int argc, char **argv)
         auth_flavor = AUTH_NONE;
         auth = authnone_create();
     } else {
-        eprint("invalid auth type %s, use -h for help\n", auth_type);
+        eprint(0, "invalid auth type %s, use -h for help", auth_type);
         exit(EX_USAGE);
     }
 
@@ -808,11 +887,9 @@ main(int argc, char **argv)
     tdargvsz = roundup(sizeof(*tdargv) * (jobs + 1), 4096);
     tdargvsz = roundup(tdargvsz, 1024 * 1024 * 2);
 
-    tdargv = mmap(NULL, tdargvsz, PROT_READ | PROT_WRITE,
-                  MAP_ALIGNED_SUPER | MAP_SHARED | MAP_ANON, -1, 0);
-    if (tdargv == MAP_FAILED) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("mmap: %s\n", errbuf);
+    tdargv = spalloc(tdargvsz);
+    if (!tdargv) {
+        eprint(errno, "mmap tdargv");
         abort();
     }
 
@@ -826,20 +903,17 @@ main(int argc, char **argv)
 
     rc = setpriority(PRIO_PROCESS, 0, -15);
     if (rc && errno != EACCES) {
-        eprint("unable to set priority: %s\n", strerror(errno));
+        eprint(errno, "unable to set priority");
     }
 
     rc = pthread_getaffinity_np(pthread_self(), sizeof(cpu_mask), &cpu_mask);
     if (rc) {
-        eprint("pthread_getaffinity_np: %s\n", strerror(errno));
+        eprint(errno, "pthread_getaffinity_np");
         abort();
     }
 
-  again:
-    memset(tdargv, 0, tdargvsz); // ensure tdargv is fully mapped...
-
     cpu_count = CPU_COUNT(&cpu_mask);
-    cpu_offset = 2;
+    cpu_offset = (rdtsc() >> 1) % cpu_count;
     cpu_step = 1;
 
     /* Find a stepping that will evenly distribute workers across cores
@@ -853,6 +927,9 @@ main(int argc, char **argv)
         }
     }
 
+  again:
+    memset(tdargv, 0, tdargvsz); // ensure tdargv is fully mapped...
+
     /* Start worker threads...
      */
     for (i = 0; i < jobs; ++i) {
@@ -863,15 +940,18 @@ main(int argc, char **argv)
         CPU_COPY(&cpu_mask, &tdargs->mask);
 
         for (j = 0; j < cpu_count && jobs < cpu_count; ++j) {
-            if (CPU_ISSET((cpu_offset + cpu_step * i) % cpu_count, &cpu_mask)) {
-                CPU_SETOF((cpu_offset + cpu_step * i) % cpu_count, &tdargs->mask);
+            int cpu = (cpu_offset + cpu_step * i) % cpu_count;
+
+            if (CPU_ISSET(cpu, &cpu_mask)) {
+                CPU_ZERO(&tdargs->mask);
+                CPU_SET(cpu, &tdargs->mask);
                 break;
             }
         }
 
         rc = pthread_create(&tdargs->td, NULL, run, tdargs);
         if (rc) {
-            eprint("pthread_create() failed: %s\n", strerror(errno));
+            eprint(errno, "pthread_create");
             abort();
         }
     }
@@ -907,11 +987,12 @@ main(int argc, char **argv)
     memset(tdargv[0].bktv, 0, sizeof(tdargv[0].bktv));
     nsecspercycle = 1000000000.0 / tsc_freq;
 
-    pct99 = pct95 = pct90 = pct50 = 0;
+    pct99 = pct90 = pct50 = pct10 = pct1 = 0;
     index99 = iters * .99;
-    index95 = iters * .95;
     index90 = iters * .90;
     index50 = iters * .50;
+    index10 = iters * .10;
+    index1 = iters * .01;
     first = last = avglat = 0;
     nsecs = n = 0;
 
@@ -938,20 +1019,25 @@ main(int argc, char **argv)
             if (n >= index99)
                 pct99 = j;
 
-            if (pct95 == 0) {
-                if (n >= index95)
-                    pct95 = j;
+            if (pct90 == 0) {
+                if (n >= index90)
+                    pct90 = j;
 
-                if (pct90 == 0) {
-                    if (n >= index90)
-                        pct90 = j;
+                if (pct50 == 0) {
+                    if (n >= index50)
+                        pct50 = j;
 
-                    if (pct50 == 0) {
-                        if (n >= index50)
-                            pct50 = j;
+                    if (pct10 == 0) {
+                        if (n >= index10)
+                            pct10 = j;
 
-                        if (first == 0)
-                            first = j;
+                        if (pct1 == 0) {
+                            if (n >= index1)
+                                pct1 = j;
+
+                            if (first == 0)
+                                first = j;
+                        }
                     }
                 }
             }
@@ -959,23 +1045,29 @@ main(int argc, char **argv)
     }
 
     if (headers) {
-        printf("%10s %4s %4s %9s %9s %8s %8s %6s %6s %6s %6s %6s %6s %7s %7s\n",
+        printf("%10s %4s %4s %9s %9s %8s %8s %6s %7s %6s %6s %6s %6s %7s %7s\n",
                "DATE", "TDS", "INF", "MSGCNT", "DURATION", "MSG/s", "Mbps",
-               "MIN", "AVG", "50%", "90%", "95%", "99%", "MAX", "RU/MSG");
+               "MIN", "1%", "10%", "50%", "90%", "99%", "MAX", "RU/MSG");
         headers = false;
     }
 
-    printf("%10ld %4u %4zu %9ld %9ld %8lu %8.2lf %6.1lf %6.1lf %6.1lf %6.1lf %6.1lf %6.1lf %7.1lf %7.2lf\n",
+    printf("%10ld %4u %4zu %9ld %9ld %8lu %8.2lf %6.1lf %7.1lf %6.1lf %6.1lf %6.1lf %6.1lf %7.1lf %7.2lf\n",
            time(NULL), jobs, msglag, iters, usecs, (iters * 1000000) / usecs,
-           (double)bytes / usecs, first / 10.0, (avglat / n) / 10.0,
-           pct50 / 10.0, pct90 / 10.0, pct95 / 10.0, pct99 / 10.0, last / 10.0,
+           (double)bytes / usecs,
+           (first / 10.0),
+           (pct1 / 10.0),
+           (pct10 / 10.0),
+           (pct50 / 10.0),
+           (pct90 / 10.0),
+           (pct99 / 10.0),
+           (last / 10.0),
            (double)ru_usecs / iters);
 
     if (itermax-- > 1)
         goto again;
 
-    munmap(tdargv, tdargvsz);
-    munmap(rxbuf, rxbufsz);
+    spfree(tdargv, tdargvsz);
+    spfree(rxbuf, rxbufsz);
     auth_destroy(auth);
     free(host);
 
@@ -1005,14 +1097,19 @@ dprint_func(int lvl, const char *func, int line, const char *fmt, ...)
 /* Error print.
  */
 void
-eprint(const char *fmt, ...)
+eprint(int err, const char *fmt, ...)
 {
     char msg[256];
     va_list ap;
+    int n;
 
     va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
+    n = vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    fprintf(eprint_fp, "%s: %s", progname, msg);
+    if (err && n >= 0 && n < sizeof(msg)) {
+        strerror_r(err, msg + n, sizeof(msg) - n);
+    }
+
+    fprintf(eprint_fp, "%s: %s\n", progname, msg);
 }

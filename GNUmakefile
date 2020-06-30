@@ -1,8 +1,16 @@
-SUBDIRS = bin kmod
+SUBDIRS = bin
+
+ifeq ($(shell uname -s),FreeBSD)
+SUBDIRS += kmod
+endif
 
 CSCOPE_DIRS ?= . /usr/src/lib /usr/src/sys
 
+.NOTPARALLEL:
+
 .PHONY: all ${SUBDIRS} ${MAKECMDGOALS}
+
+all ${MAKECMDGOALS}: ${SUBDIRS}
 
 clobber: ${SUBDIRS}
 	rm -f cscope.* TAGS
@@ -19,8 +27,6 @@ tags etags: TAGS
 
 TAGS: cscope.files
 	cat cscope.files | xargs etags -a --members --output=$@
-
-all ${MAKECMDGOALS}: ${SUBDIRS}
 
 ${SUBDIRS}:
 	${MAKE} -C $@ ${MAKECMDGOALS}

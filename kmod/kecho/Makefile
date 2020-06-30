@@ -19,7 +19,7 @@ CLEANFILES += cscope.* TAGS ${KMOD}.objdump .depend.*.o
 CSCOPE_DIRS ?= . ${VPATH} /usr/src/lib /usr/src/sys
 CTAGS = true
 
-.PHONY:	clobber cscope debug etags tags objdump
+.PHONY:	clobber cscope debug distclean etags tags objdump
 
 clobber: clean
 
@@ -32,6 +32,8 @@ cscope.files:
 	find ${CSCOPE_DIRS} -name \*.[chsSyl] -o -name \*.cpp > $@
 
 debug: all
+
+distclean: clean
 
 objdump:
 	objdump -sdwx -Mintel --prefix-addresses ${KMOD}.o > ${KMOD}.objdump

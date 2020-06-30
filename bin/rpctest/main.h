@@ -36,7 +36,7 @@ extern void dprint_func(int lvl, const char *func, int line, const char *fmt, ..
 /* You should call eprint() to print error messages that should always be shown.
  * It simply prints the given message preceded by the program name.
  */
-extern void eprint(const char *fmt, ...)
-    __attribute__((format (printf, 1, 2)));
+extern void eprint(int err, const char *fmt, ...)
+    __attribute__((format (printf, 2, 3)));
 
 #endif /* XX_MAIN_H */
