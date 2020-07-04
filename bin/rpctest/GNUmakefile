@@ -17,6 +17,10 @@ PLATFORM	:= $(shell uname -s | tr 'a-z' 'A-Z')
 INCLUDE 	:= -I. -I../../lib -I../../include
 CDEFS 		:= -DPROG_VERSION=\"${PROG_VERSION}\"
 
+# Comment out to force use of clock_gettime() in liue of rdtsc().
+#
+CDEFS 		+= -DHAVE_TSC=__amd64__
+
 ifneq ($(wildcard /usr/include/tirpc/rpc/rpc.h),)
 	INCLUDE := -I/usr/include/tirpc ${INCLUDE}
 	CDEFS += -DHAVE_TIRPC

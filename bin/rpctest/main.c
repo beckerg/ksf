@@ -84,12 +84,25 @@ do {                                \
     CPU_OR((_dst), (_src), (_src)); \
 } while (0)
 
+size_t __attribute__((__weak__))
+strlcat(char *dst, const char *src, size_t dstsize)
+{
+    return strlen(strcat(dst, src)); // TODO...
+}
 #endif
 
-#define SPALIGN         (1024 * 1024 * 2ul) // Superpage alignment
-#define BKTV_MAX        (1024 * 1024 * 4u)
-#define MSGLAG_MAX      (1024)
-#define NFS3_NULL       (0)
+/* SPALIGN     Superpage alignment
+ * BKTV_MAX    Max buckets in latency histogram
+ * MSGINF_MAX  Max messages in flight per thread
+ * MSGSZ_MAX   Max rx/tx message size
+ */
+#define SPALIGN             (1024 * 1024 * 2ul)
+#define BKTV_MAX            (1024 * 1024 * 16ul)
+#define MSGINF_MAX          (1024)
+#define MSGSZ_MAX           (128)
+#define NFS3_NULL           (0)
+
+#define NELEM(_a)           (sizeof(_a) / sizeof((_a)[0]))
 
 #ifndef __read_mostly
 #define __read_mostly       __attribute__((__section__(".read_mostly")))
@@ -107,6 +120,14 @@ do {                                \
 #include "clp.h"
 #include "ksf.h"
 
+/* Time-stamp interval type...
+ */
+#if HAVE_TSC
+typedef uint64_t            tsi_t;
+#else
+typedef struct timespec     tsi_t;
+#endif
+
 char version[] = PROG_VERSION;
 char *progname;
 int verbosity;
@@ -116,7 +137,6 @@ FILE *eprint_fp;
 
 pthread_barrier_t bar_start;
 pthread_barrier_t bar_end;
-size_t msgmax = 128 * 1024;
 long duration = 600;
 u_int itermax = UINT_MAX;
 u_int jobs = 1;
@@ -129,25 +149,35 @@ AUTH *auth;
 char *host;
 bool udp;
 
+double nsecspercycle;
+double quantilev[16];
+char *quantiles;
+int quantilec;
+
 u_long msgcnt __read_mostly;
-size_t msglag __read_mostly;
-bool have_tsc __read_mostly;
+size_t msginf __read_mostly;
+uint tsc_scale __read_mostly;
 uint64_t tsc_freq __read_mostly;
 
 struct tdargs {
     struct sockaddr_in faddr;
-    cpuset_t mask;
     pthread_t td;
-    char *rxbuf;
-    size_t bytes;
+    int job;
+    int cpu;
     long iters;
-    long usecs;
-    long ru_usecs;
+    uint64_t elapsed;
+    size_t spbufsz;
+    char *spbuf;
+    char *rxbuf;
+    uint32_t *bktv;
+    tsi_t *startv;
+
+    __aligned(CACHE_LINE_SIZE)
+    size_t bytes;
     long tx_eagain;
     long rx_eagain;
-    uint64_t startv[MSGLAG_MAX];
-    uint bktv[BKTV_MAX];
-} __aligned(CACHE_LINE_SIZE);
+    uint64_t latmax;
+};
 
 static clp_posparam_t posparamv[] = {
     { .name = "host",
@@ -163,46 +193,62 @@ static clp_option_t optionv[] = {
     CLP_OPTION_HELP,
 
     CLP_OPTION(string, 'A', auth_type, NULL, NULL, "auth type (none, sys, unix)"),
-    CLP_OPTION(size_t, 'a', msglag, NULL, NULL, "max number of inflight RPCs (per thread)"),
+    CLP_OPTION(size_t, 'a', msginf, NULL, NULL, "max number of inflight RPCs (per thread)"),
     CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "max messages to send (per thread)"),
     CLP_OPTION(bool, 'f', fragged, NULL, NULL, "break each RPC into three records"),
     CLP_OPTION(bool, 'H', headers, NULL, NULL, "suppress headers"),
     CLP_OPTION(u_int, 'i', itermax, NULL, NULL, "max iterations"),
     CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of threads/connections"),
-    CLP_OPTION(bool, 'T', have_tsc, NULL, NULL, "do not use TSC"),
+    CLP_OPTION(string, 'q', quantiles, NULL, NULL, "comma-separated list of quantiles"),
     CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
-
     CLP_OPTION_END
 };
 
-#if __linux__ && __amd64__
-static inline uint64_t
-__rdtsc(void)
+static uint64_t
+cycles2nsecs(uint64_t cycles)
 {
-    uint32_t low, high;
-
-    __asm __volatile("rdtsc" : "=a" (low), "=d" (high));
-
-    return (low | ((u_int64_t)high << 32));
-}
-#endif
-
-static inline uint64_t
-rdtsc(void)
-{
-    struct timeval tv;
-
-#if __amd64__
-    if (likely(have_tsc))
-        return __rdtsc();
-#endif
-
-    gettimeofday(&tv, NULL);
-
-    return (tv.tv_sec * 1000000 + tv.tv_usec);
+    return cycles * nsecspercycle;
 }
 
-/* Allocate one or more superpages...
+#if HAVE_TSC && __linux__
+#define __rdtsc()   __builtin_ia32_rdtsc()
+#endif
+
+/* Record the start time for a time stamp interval measurement.
+ */
+static inline void
+tsi_start(tsi_t *start)
+{
+#if HAVE_TSC
+    *start = __rdtsc();
+#else
+    clock_gettime(CLOCK_MONOTONIC, start);
+#endif
+}
+
+/* Return the difference in time between the current time
+ * and the given earlier time stamp.  Always returns "cycles"
+ * which can be converted to nanoseconds via cycles2nsecs().
+ */
+static inline uint64_t
+tsi_delta(tsi_t *start)
+{
+#if HAVE_TSC
+    return __rdtsc() - *start;
+#else
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    timespecsub(&now, start, &now);
+
+    return now.tv_sec * 1000000000ul + now.tv_nsec;
+#endif
+}
+
+
+/* Allocate one or more superpages.  Falls back to normal
+ * pages if superpages cannot be allocated.
  */
 void *
 spalloc(size_t sz)
@@ -212,8 +258,7 @@ spalloc(size_t sz)
     int super = MAP_ALIGNED_SUPER;
     void *mem;
 
-    if (sz & (SPALIGN - 1))
-        return NULL;
+    sz = roundup(sz, 1024 * 1024 * 2);
 
   again:
     mem = mmap(NULL, sz, prot, flags, -1, 0);
@@ -225,15 +270,16 @@ spalloc(size_t sz)
         }
     }
 
+    if (!super)
+        dprint(1, "unable to mmap %zu superpages\n", sz / SPALIGN);
+
     return (mem == MAP_FAILED) ? NULL : mem;
 }
 
 int
 spfree(void *mem, size_t sz)
 {
-    assert(mem && !((uintptr_t)mem & (SPALIGN - 1)) && !(sz & (SPALIGN - 1)));
-
-    return munmap(mem, sz);
+    return munmap(mem, roundup(sz, 1024 * 1024 * 2));
 }
 
 int
@@ -317,24 +363,27 @@ rpc_decode(XDR *xdr, struct rpc_msg *msg, struct rpc_err *err)
     return err->re_status;
 }
 
-/* Asynchronous send/recv loop.  Note that the send can race ahead
- * of the receiver by at most msglag messages.
+/* Asynchronous send/recv loop.  Note that the sender can race ahead
+ * of the receiver by at most msginf messages.
  */
 int
 nullproc_async(int fd, struct tdargs *tdargs)
 {
-    char *rxbuf, *txbuf;
+    tsi_t *startv;
+    uint32_t *bktv;
+
+    __aligned(CACHE_LINE_SIZE) // separate from read-mostly vars, above...
     ssize_t rxlen, txlen, txfrag, txfragmax, cc;
     uint32_t rxmax, rxoff, rmlen;
     int rxflags, txflags;
     u_long msgrx, msgtx;
-    uint64_t *startv, stop;
-    u_int *bktv;
+    char *rxbuf, *txbuf;
+    uint64_t stop;
     bool last;
     int rc;
 
     rxbuf = tdargs->rxbuf;
-    txbuf = rxbuf + roundup(msgmax, 4096);
+    txbuf = rxbuf + roundup(MSGSZ_MAX, 4096);
     txflags = MSG_DONTWAIT;
     rxflags = MSG_DONTWAIT;
     msgrx = msgtx = 0;
@@ -350,11 +399,11 @@ nullproc_async(int fd, struct tdargs *tdargs)
     txlen = 0;
 
     while (msgrx < msgcnt) {
-        if (msgtx < msgcnt && msgtx - msgrx < msglag) {
+        if (msgtx < msgcnt && msgtx - msgrx < msginf) {
             if (txlen == 0) {
-                startv[msgtx % MSGLAG_MAX] = rdtsc();
+                tsi_start(&startv[msgtx % MSGINF_MAX]);
 
-                txlen = rpc_encode(msgtx, NFS3_NULL, auth, txbuf, msgmax);
+                txlen = rpc_encode(msgtx, NFS3_NULL, auth, txbuf, MSGSZ_MAX);
 
                 txfragmax = 8192;
                 if (txfragmax > txlen)
@@ -380,7 +429,7 @@ nullproc_async(int fd, struct tdargs *tdargs)
             }
         }
 
-        rxflags = (msgtx - msgrx < msglag) ? MSG_DONTWAIT : 0;
+        rxflags = (msgtx - msgrx < msginf) ? MSG_DONTWAIT : 0;
 
         /* Peek at the RPC record mark so that we can get the
          * size of the record fragment.
@@ -476,17 +525,13 @@ nullproc_async(int fd, struct tdargs *tdargs)
                     break;
                 }
 
-                stop = rdtsc() - startv[msg.rm_xid % MSGLAG_MAX];
+                stop = tsi_delta(&startv[msg.rm_xid % MSGINF_MAX]);
+                stop >>= tsc_scale;
 
-                if (stop >= BKTV_MAX)
-                    stop = BKTV_MAX - 1;
-
-                ++bktv[stop];
-
-#ifdef DEBUG
-                assert(startv[msg.rm_xid % MSGLAG_MAX] > 0);
-                startv[msg.rm_xid % MSGLAG_MAX] = 0;
-#endif
+                if (likely( stop < BKTV_MAX ))
+                    ++bktv[stop];
+                else if (stop > tdargs->latmax)
+                    tdargs->latmax = stop;
 
                 rxbuf = tdargs->rxbuf;
                 ++msgrx;
@@ -519,7 +564,8 @@ nullproc_async(int fd, struct tdargs *tdargs)
 int
 nullproc_sync(int fd, struct tdargs *tdargs)
 {
-    uint64_t *startv, stop;
+    tsi_t *startv;
+    uint64_t stop;
     char *rxbuf, *txbuf;
     u_int *bktv;
     ssize_t cc;
@@ -527,7 +573,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
     int rc;
 
     rxbuf = tdargs->rxbuf;
-    txbuf = rxbuf + roundup(msgmax, 4096);
+    txbuf = rxbuf + roundup(MSGSZ_MAX, 4096);
     msgrx = 0;
     rc = 0;
 
@@ -543,9 +589,9 @@ nullproc_sync(int fd, struct tdargs *tdargs)
         bool last;
         XDR xdr;
 
-        startv[msgrx % MSGLAG_MAX] = rdtsc();
+        tsi_start(&startv[msgrx % MSGINF_MAX]);
 
-        rpclen = rpc_encode(msgrx, NFS3_NULL, auth, txbuf, msgmax);
+        rpclen = rpc_encode(msgrx, NFS3_NULL, auth, txbuf, MSGSZ_MAX);
         if (rpclen == -1) {
             eprint(0, "rpc_encode: len %d, msgrx %ld", rpclen, msgrx);
             abort();
@@ -609,12 +655,13 @@ nullproc_sync(int fd, struct tdargs *tdargs)
             break;
         }
 
-        stop = rdtsc() - startv[rmsg.rm_xid % MSGLAG_MAX];
+        stop = tsi_delta(&startv[rmsg.rm_xid % MSGINF_MAX]);
+        stop >>= tsc_scale;
 
-        if (stop >= BKTV_MAX)
-            stop = BKTV_MAX - 1;
-
-        ++bktv[stop];
+        if (likely( stop < BKTV_MAX ))
+            ++bktv[stop];
+        else if (stop > tdargs->latmax)
+            tdargs->latmax = stop;
 
         tdargs->bytes += cc + rpclen + RPC_RECMARK_SZ;
         ++msgrx;
@@ -628,22 +675,27 @@ nullproc_sync(int fd, struct tdargs *tdargs)
 void *
 run(void *arg)
 {
-    struct timeval tv_start, tv_stop, tv_diff;
-    struct timeval ru_utime, ru_stime, ru_total;
+    size_t rxbufsz, startvsz, bktvsz;
     struct rusage ru_start, ru_stop;
     struct tdargs *tdargs = arg;
-    long usecs;
+    long majflt, minflt;
     int fd, rc;
+    tsi_t tsi;
 
-#if __FreeBSD__
-    rc = pthread_setaffinity_np(tdargs->td, sizeof(tdargs->mask), &tdargs->mask);
+#if 0
+    cpuset_t cpuset;
+
+    CPU_ZERO(&cpuset);
+    CPU_SET(tdargs->cpu, &cpuset);
+
+    rc = pthread_setaffinity_np(tdargs->td, sizeof(cpuset), &cpuset);
     if (rc) {
         eprint(errno, "pthread_setaffinity_np");
         abort();
     }
 #endif
 
-    /* Reschedule to ensure are running on the desired CPU...
+    /* Reschedule to ensure we awaken on the desired CPU...
      */
     usleep(10000);
 
@@ -659,44 +711,48 @@ run(void *arg)
         abort();
     }
 
-    /* It's not necessary to zero the startv[] array, but this may
-     * well serve to kick to the cpu into turbo boost...
-     */
-    memset(tdargs->startv, 0, sizeof(tdargs->startv));
+    rxbufsz = roundup(MSGSZ_MAX, 4096) * 2;
+    startvsz = sizeof(tdargs->startv[0]) * MSGINF_MAX;
+    bktvsz = sizeof(tdargs->bktv[0]) * BKTV_MAX;
+    tdargs->spbufsz = rxbufsz + startvsz + bktvsz;
 
-    errno = 0;
-    rc = pthread_barrier_wait(&bar_start);
-    if (rc && errno)
+    tdargs->spbuf = spalloc(tdargs->spbufsz);
+    if (!tdargs->spbuf) {
+        eprint(errno, "spalloc spbuf %zu", tdargs->spbufsz);
         abort();
+    }
 
-    getrusage(RUSAGE_SELF, &ru_start);
-    gettimeofday(&tv_start, NULL);
+    memset(tdargs->spbuf, 0, tdargs->spbufsz);
+    tdargs->rxbuf = tdargs->spbuf;
+    tdargs->startv = (tsi_t *)(tdargs->spbuf + rxbufsz);
+    tdargs->bktv = (uint32_t *)(tdargs->spbuf + rxbufsz + startvsz);
 
-    if (msglag > 0)
+    /* Wait until all other workers have finished initializing...
+     */
+    pthread_barrier_wait(&bar_start);
+
+    getrusage(RUSAGE_THREAD, &ru_start);
+    tsi_start(&tsi);
+
+    if (msginf > 0)
         rc = nullproc_async(fd, tdargs);
     else
         rc = nullproc_sync(fd, tdargs);
 
-    gettimeofday(&tv_stop, NULL);
-    getrusage(RUSAGE_SELF, &ru_stop);
+    tdargs->elapsed = tsi_delta(&tsi);
+    getrusage(RUSAGE_THREAD, &ru_stop);
 
+    /* Reqlinquish the cpu until all other workers have finished.
+     */
     pthread_barrier_wait(&bar_end);
 
-    timersub(&tv_stop, &tv_start, &tv_diff);
-    usecs = tv_diff.tv_sec * 1000000 + tv_diff.tv_usec;
-    tdargs->usecs = usecs;
+    majflt = ru_stop.ru_majflt - ru_start.ru_majflt;
+    minflt = ru_stop.ru_minflt - ru_start.ru_minflt;
 
-    timersub(&ru_stop.ru_utime, &ru_start.ru_utime, &ru_utime);
-    timersub(&ru_stop.ru_stime, &ru_start.ru_stime, &ru_stime);
-    timeradd(&ru_utime, &ru_stime, &ru_total);
-    tdargs->ru_usecs = ru_total.tv_sec * 1000000 + ru_total.tv_usec;
-
-    dprint(2, "%p, fd %2d, usecs %ld, ru %ld %.2lf, msgs/sec %ld, bytes/sec %ld, %ld %ld\n",
-           (void *)tdargs->td, fd, usecs,
-           tdargs->ru_usecs, (double)tdargs->ru_usecs / tdargs->iters,
-           (tdargs->iters * 1000000) / usecs,
-           (tdargs->bytes * 1000000) / usecs,
-           tdargs->tx_eagain, tdargs->rx_eagain);
+    if (majflt > 0 || minflt > 2) {
+        eprint(0, "job %2d: unexpected maj/min faults: maj %ld, min %ld",
+               tdargs->job, majflt, minflt);
+    }
 
     close(fd);
     pthread_exit(NULL);
@@ -714,28 +770,16 @@ int
 main(int argc, char **argv)
 {
     char serverip[INET_ADDRSTRLEN + 1];
-    long iters, usecs, ru_usecs;
     struct sockaddr_in faddr;
     struct tdargs *tdargv;
-    double nsecspercycle;
     struct hostent *hent;
     char *server, *user;
-    size_t tdargvsz;
-    size_t rxbufsz;
-    size_t bytes;
-    long *prxbuf;
-    char *rxbuf;
-    int i;
+    int i, j;
 
     int cpu_count, cpu_offset, cpu_step;
-    cpuset_t cpu_mask;
+    cpuset_t cpuset;
 
-    uint index99, index90, index50, index10, index1;
-    uint pct99, pct90, pct50, pct10, pct1;
-    uint first, last, avglat;
-    int n, j, jmax;
-    long nsecs;
-
+    char *quantilebase;
     char errbuf[128];
     char state[256];
     int optind;
@@ -746,14 +790,16 @@ main(int argc, char **argv)
     progname = (progname ? progname + 1 : argv[0]);
 
     initstate((u_long)time(NULL), state, sizeof(state));
+    quantilebase = strdup(".3, 4.6, 31.7, 50, 68.3, 95.4, 99.7");
+    quantiles = quantilebase;
     dprint_fp = stderr;
     eprint_fp = stderr;
-    tsc_freq = 1000000;
-    have_tsc = false;
+    tsc_scale = 4;
+    tsc_freq = 0;
     msgcnt = 1000000;
-    msglag = 1;
+    msginf = 1;
 
-#if __amd64__
+#if HAVE_TSC
 #if __FreeBSD__
     uint64_t val = 0;
     size_t valsz = sizeof(val);
@@ -769,24 +815,30 @@ main(int argc, char **argv)
         if (rc) {
             eprint(errno, "sysctlbyname(machdep.tsc_freq)");
         } else {
-            have_tsc = true;
             tsc_freq = val;
         }
     }
 #elif __linux__
     const char cmd[] = "lscpu | sed -En 's/^Model name.*([0-9]\\.[0-9][0-9])GHz$/\\1/p'";
-    char buf[32];
+    char line[32];
     FILE *fp;
 
     fp = popen(cmd, "r");
     if (fp) {
-        if (fgets(buf, sizeof(buf), fp)) {
-            tsc_freq = strtod(buf, NULL) * 1000000000;
-            have_tsc = true;
+        if (fgets(line, sizeof(line), fp)) {
+            tsc_freq = strtod(line, NULL) * 1000000000;
         }
         pclose(fp);
     }
 #endif
+
+    if (tsc_freq < 1000000) {
+        eprint(0, "unable to determine TSC frequency, disable HAVE_TSC in GNUmakefile to use clock_gettime()");
+        exit(EX_UNAVAILABLE);
+    }
+
+#else
+    tsc_freq = 1000000000;
 #endif
 
     rc = clp_parsev(argc, argv, optionv, posparamv, errbuf, sizeof(errbuf), &optind);
@@ -798,7 +850,54 @@ main(int argc, char **argv)
     if (given('h') || given('V'))
         return 0;
 
-    dprint(1, "have_tsc %d, tsc_freq %lu\n", have_tsc, tsc_freq);
+    nsecspercycle = 1000000000.0 / tsc_freq;
+    tsc_scale += (tsc_freq / 1000000000);
+
+    dprint(1, "tsc_freq %lu, tsc_scale %u, nsecs/cycle %lf, sampleres %luns\n",
+           tsc_freq, tsc_scale, nsecspercycle,
+           ((1ul << tsc_scale) * 1000000000ul) / tsc_freq);
+
+    if (quantiles) {
+        char *buf = quantiles;
+        char *tok, *end;
+        int n;
+
+        for (n = 0; buf && n < NELEM(quantilev); ++n, ++quantilec) {
+            while (isspace(*buf))
+                ++buf;
+
+            tok = strsep(&buf, ",");
+            if (!tok || !tok[0])
+                break;
+
+            errno = 0;
+            quantilev[n] = strtod(tok, &end);
+            if (errno) {
+                eprint(errno, "unable to convert percentile `%s'", tok);
+                exit(EX_DATAERR);
+            }
+
+            while (end && isspace(*end))
+                ++end;
+
+            if ((quantilev[n] == 0 && end == tok) || (end && *end)) {
+                eprint(EINVAL, "unable to convert percentile `%s'", tok);
+                exit(EX_DATAERR);
+            }
+            if (n > 0 && quantilev[n] < quantilev[n - 1]) {
+                eprint(EINVAL, "percentile %lf is smaller than preceding percentile",
+                       quantilev[n]);
+                exit(EX_DATAERR);
+            }
+            if (quantilev[n] < 0 || quantilev[n] > 100) {
+                eprint(EINVAL, "percentile %lf is less than 0 or greater than 100",
+                       quantilev[n]);
+                exit(EX_DATAERR);
+            }
+        }
+
+        // TODO: sort list...
+    }
 
     argc -= optind;
     argv += optind;
@@ -848,19 +947,8 @@ main(int argc, char **argv)
 
     if (msgcnt < 1)
         msgcnt = 1;
-    if (msgmax < RPC_RECMARK_SZ + 8)
-        msgmax = RPC_RECMARK_SZ + 8;
-    if (msglag > MSGLAG_MAX)
-        msglag = MSGLAG_MAX;
-
-    rxbufsz = roundup(msgmax, 4096) * 2 * jobs;
-    rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);
-
-    rxbuf = spalloc(rxbufsz);
-    if (!rxbuf) {
-        eprint(errno, "mmap rxbuf");
-        abort();
-    }
+    if (msginf >= MSGINF_MAX)
+        msginf = MSGINF_MAX - 1;
 
     if (0 == strcasecmp(auth_type, "sys")) {
         auth_flavor = AUTH_SYS;
@@ -876,24 +964,15 @@ main(int argc, char **argv)
         exit(EX_USAGE);
     }
 
-    rc = rpc_encode(msgcnt, NFS3_NULL, auth, rxbuf, rxbufsz);
-    dprint(1, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, authtype auth%s, rc %d\n",
-           sizeof(struct rpc_msg), sizeof(struct call_body), auth_type, rc);
+    if (verbosity > 0) {
+        char msgbuf[128];
 
-    prxbuf = (long *)rxbuf;
-    for (i = 0; i < rxbufsz / sizeof(*prxbuf); i += sizeof(*prxbuf))
-        *prxbuf++ = (long)(rxbuf + i);
-
-    tdargvsz = roundup(sizeof(*tdargv) * (jobs + 1), 4096);
-    tdargvsz = roundup(tdargvsz, 1024 * 1024 * 2);
-
-    tdargv = spalloc(tdargvsz);
-    if (!tdargv) {
-        eprint(errno, "mmap tdargv");
-        abort();
+        rc = rpc_encode(msgcnt, NFS3_NULL, auth, msgbuf, sizeof(msgbuf));
+        dprint(1, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, authtype auth%s, rpclen %d\n",
+               sizeof(struct rpc_msg), sizeof(struct call_body), auth_type, rc);
     }
 
-    rc = pthread_barrier_init(&bar_start, NULL, jobs);
+    rc = pthread_barrier_init(&bar_start, NULL, jobs + 1);
     if (rc)
         abort();
 
@@ -901,25 +980,22 @@ main(int argc, char **argv)
     if (rc)
         abort();
 
-    rc = setpriority(PRIO_PROCESS, 0, -15);
+    rc = setpriority(PRIO_PROCESS, 0, -20);
     if (rc && errno != EACCES) {
         eprint(errno, "unable to set priority");
     }
 
-    rc = pthread_getaffinity_np(pthread_self(), sizeof(cpu_mask), &cpu_mask);
+    rc = pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
     if (rc) {
         eprint(errno, "pthread_getaffinity_np");
         abort();
     }
 
-    cpu_count = CPU_COUNT(&cpu_mask);
-    cpu_offset = (rdtsc() >> 1) % cpu_count;
+    /* Find a stepping that will evenly distribute workers across cores...
+     */
+    cpu_count = CPU_COUNT(&cpuset);
     cpu_step = 1;
 
-    /* Find a stepping that will evenly distribute workers across cores
-     * (assumes two HT threads per core that have sequential logical CPU
-     * numbering, which isn't always true).
-     */
     for (i = 3; i < cpu_count; ++i) {
         if (cpu_count % i) {
             cpu_step = i;
@@ -927,8 +1003,34 @@ main(int argc, char **argv)
         }
     }
 
+    uint64_t elapsed_min, elapsed_max, elapsed_avg;
+    size_t bytes_total;
+    long iters_total;
+
+    char latmaxbuf[jobs * 16], *latmaxcomma;
+    int msgcntwidth, maxwidth;
+    int jmin, jmax;
+    long nsecs, n;
+
+    msgcntwidth = snprintf(NULL, 0, "%lu", msgcnt * jobs);
+    if (msgcntwidth < 7)
+        msgcntwidth = 7;
+
+    maxwidth = 8;
+
   again:
-    memset(tdargv, 0, tdargvsz); // ensure tdargv is fully mapped...
+    tdargv = calloc(jobs, sizeof(*tdargv));
+    if (!tdargv) {
+        eprint(errno, "malloc tdargv %d", jobs);
+        abort();
+    }
+
+    cpu_offset = (__rdtsc() / 1000) % cpu_count;
+    jmin = BKTV_MAX, jmax = 0;
+    latmaxbuf[0] = '\000';
+    latmaxcomma = "*  ";
+    elapsed_min = UINT64_MAX;
+    elapsed_max = 0;
 
     /* Start worker threads...
      */
@@ -936,27 +1038,31 @@ main(int argc, char **argv)
         struct tdargs *tdargs = tdargv + i;
 
         memcpy(&tdargs->faddr, &faddr, sizeof(tdargs->faddr));
-        tdargs->rxbuf = rxbuf + roundup(msgmax, 4096) * 2 * i;
-        CPU_COPY(&cpu_mask, &tdargs->mask);
+        tdargs->job = i;
 
         for (j = 0; j < cpu_count && jobs < cpu_count; ++j) {
             int cpu = (cpu_offset + cpu_step * i) % cpu_count;
 
-            if (CPU_ISSET(cpu, &cpu_mask)) {
-                CPU_ZERO(&tdargs->mask);
-                CPU_SET(cpu, &tdargs->mask);
+            if (CPU_ISSET(cpu, &cpuset)) {
+                tdargs->cpu = cpu;
                 break;
             }
         }
 
         rc = pthread_create(&tdargs->td, NULL, run, tdargs);
         if (rc) {
-            eprint(errno, "pthread_create");
+            eprint(rc, "pthread_create thread %d of %d", j, cpu_count);
             abort();
         }
     }
 
-    bytes = usecs = iters = ru_usecs = jmax = 0;
+    /* Release the hounds!
+     */
+    rc = pthread_barrier_wait(&bar_start);
+    if (rc > 0) {
+        eprint(rc, "pthread_barrier_wait");
+        abort();
+    }
 
     /* Wait for all worker threads to complete...
      */
@@ -965,111 +1071,174 @@ main(int argc, char **argv)
         void *val;
 
         rc = pthread_join(tdargs->td, &val);
+        if (rc) {
+            eprint(rc, "pthread_join thread %d of %d", i, cpu_count);
+            abort();
+        }
 
-        bytes += tdargs->bytes;
-        iters += tdargs->iters;
-        usecs += tdargs->usecs;
-        ru_usecs += tdargs->ru_usecs;
-
-        /* Coalesce all per-bkt latency counts...
+        /* If the max latency of this job overflowed the latency
+         * hash table then append it (in msecs) to the list.
          */
+        if (tdargs->latmax > 0) {
+            size_t len = strlen(latmaxbuf);
+
+            nsecs = cycles2nsecs(tdargs->latmax << tsc_scale);
+
+            if (tdargs->latmax > tdargv[0].latmax)
+                tdargv[0].latmax = tdargs->latmax;
+
+            snprintf(latmaxbuf + len, sizeof(latmaxbuf) - len, "%s%ld",
+                     latmaxcomma, nsecs / 1000000);
+            latmaxcomma = ",";
+        }
+
+        if (tdargs->elapsed < elapsed_min)
+            elapsed_min = tdargs->elapsed;
+        if (tdargs->elapsed > elapsed_max)
+            elapsed_max = tdargs->elapsed;
+
+        if (i == 0)
+            continue;
+
+        /* Accumulate results from all other workers into tdargv[0]...
+         */
+        tdargv[0].bytes += tdargs->bytes;
+        tdargv[0].iters += tdargs->iters;
+        tdargv[0].elapsed += tdargs->elapsed;
+        tdargv[0].rx_eagain += tdargs->rx_eagain;
+        tdargv[0].tx_eagain += tdargs->tx_eagain;
+
         for (j = 0; j < BKTV_MAX; ++j) {
             if (tdargs->bktv[j] > 0) {
-                tdargv[jobs].bktv[j] += tdargs->bktv[j];
-                if (j >= jmax)
+                tdargv[0].bktv[j] += tdargs->bktv[j];
+
+                if (j > jmax)
                     jmax = j + 1;
+                if (j < jmin)
+                    jmin = j;
             }
         }
     }
 
-    usecs /= jobs;
+    if (jobs < 2) {
+        jmax = BKTV_MAX;
+        jmin = 0;
+    }
 
-    memset(tdargv[0].bktv, 0, sizeof(tdargv[0].bktv));
-    nsecspercycle = 1000000000.0 / tsc_freq;
+    bytes_total = tdargv[0].bytes;
+    iters_total = tdargv[0].iters;
+    elapsed_min = cycles2nsecs(elapsed_min) / 1000;
+    elapsed_max = cycles2nsecs(elapsed_max) / 1000;
+    elapsed_avg = cycles2nsecs(tdargv[0].elapsed) / (jobs * 1000);
 
-    pct99 = pct90 = pct50 = pct10 = pct1 = 0;
-    index99 = iters * .99;
-    index90 = iters * .90;
-    index50 = iters * .50;
-    index10 = iters * .10;
-    index1 = iters * .01;
-    first = last = avglat = 0;
+    char buf[quantilec * 16 + 128];
+    long indexv[quantilec];
+    long pctv[quantilec];
+    int first, last;
+    int pctvmin = 0;
+    int *hitsv;
+
+    for (i = 0; i < quantilec; ++i) {
+        indexv[i] = (iters_total * quantilev[i]) / 100;
+        pctv[i] = 0;
+    }
+
+    first = last = 0;
     nsecs = n = 0;
 
-    /* Convert latency info from cycles to hundredths of usecs...
+    /* The hits vector is indexed by latency (in hundreds of nanoseconds)
+     * and is used to determine the latency at the given quantiles.
      */
-    for (j = 0; j < jmax; ++j) {
-        if (tdargv[jobs].bktv[j] > 0) {
-            nsecs = j * nsecspercycle;
-            tdargv[0].bktv[nsecs / 100] += tdargv[jobs].bktv[j];
+    hitsv = calloc(jmax, sizeof(*hitsv));
+    if (!hitsv) {
+        eprint(errno, "calloc hitsv %d", jmax);
+        abort();
+    }
+
+    /* Convert latency info from cycles to hundreds of nanoseconds...
+     */
+    for (j = jmin; j < jmax; ++j) {
+        if (tdargv[0].bktv[j] > 0) {
+            nsecs = cycles2nsecs(j << tsc_scale);
+            hitsv[nsecs / 100] += tdargv[0].bktv[j];
         }
     }
 
-    /* Compute percentiles...
+    /* Find quantiles...
      */
     for (j = 0; j < (nsecs / 100) + 1; ++j) {
-        if (tdargv[0].bktv[j] == 0)
+        if (hitsv[j] == 0)
             continue;
 
-        avglat += tdargv[0].bktv[j] * j;
-        n += tdargv[0].bktv[j];
+        n += hitsv[j];
+
+        if (first == 0)
+            first = j;
         last = j;
 
-        if (pct99 == 0) {
-            if (n >= index99)
-                pct99 = j;
-
-            if (pct90 == 0) {
-                if (n >= index90)
-                    pct90 = j;
-
-                if (pct50 == 0) {
-                    if (n >= index50)
-                        pct50 = j;
-
-                    if (pct10 == 0) {
-                        if (n >= index10)
-                            pct10 = j;
-
-                        if (pct1 == 0) {
-                            if (n >= index1)
-                                pct1 = j;
-
-                            if (first == 0)
-                                first = j;
-                        }
-                    }
+        for (i = quantilec - 1; i >= pctvmin; --i) {
+            if (pctv[i] == 0) {
+                if (n >= indexv[i]) {
+                    if (i == pctvmin)
+                        ++pctvmin;
+                    pctv[i] = j;
                 }
             }
         }
     }
 
+    free(hitsv);
+
     if (headers) {
-        printf("%10s %4s %4s %9s %9s %8s %8s %6s %7s %6s %6s %6s %6s %7s %7s\n",
-               "DATE", "TDS", "INF", "MSGCNT", "DURATION", "MSG/s", "Mbps",
-               "MIN", "1%", "10%", "50%", "90%", "99%", "MAX", "RU/MSG");
+        n = snprintf(buf, sizeof(buf),
+                     "%10s %3s %4s %*s %7s %7s %8s %8s %6s %7s",
+                     "DATE", "TD", "INF",
+                     msgcntwidth + 1, "MSGCNT",
+                     "MINTIME", "MAXTIME",
+                     "MINMSG", "MAXMSG",
+                     "Mbps", "MINLAT");
+
+        for (i = 0; i < quantilec; ++i) {
+            const char *fmt = " %7.1lf";
+
+            if (quantilev[i] > 49.999 && quantilev[i] < 50.001)
+                fmt = "     MED";
+            else if ((long)(quantilev[i] * 1000) % 1000 == 0)
+                fmt = " %7.0lf";
+
+            n += snprintf(buf + n, sizeof(buf) - n, fmt, quantilev[i]);
+        }
+
+        printf("%s %*s\n", buf, maxwidth, "MAXLAT");
         headers = false;
     }
 
-    printf("%10ld %4u %4zu %9ld %9ld %8lu %8.2lf %6.1lf %7.1lf %6.1lf %6.1lf %6.1lf %6.1lf %7.1lf %7.2lf\n",
-           time(NULL), jobs, msglag, iters, usecs, (iters * 1000000) / usecs,
-           (double)bytes / usecs,
-           (first / 10.0),
-           (pct1 / 10.0),
-           (pct10 / 10.0),
-           (pct50 / 10.0),
-           (pct90 / 10.0),
-           (pct99 / 10.0),
-           (last / 10.0),
-           (double)ru_usecs / iters);
+    n = snprintf(buf, sizeof(buf),
+                 "%10ld %3u %4zu %*ld %7.3lf %7.3lf %8lu %8lu %6.1lf %7.1lf",
+                 time(NULL), jobs, msginf,
+                 msgcntwidth + 1, iters_total,
+                 elapsed_min / 1000000.0, elapsed_max / 1000000.0,
+                 (iters_total * 1000000) / elapsed_max,
+                 (iters_total * 1000000) / elapsed_min,
+                 (double)bytes_total / elapsed_avg, (first / 10.0));
+
+    for (i = 0; i < quantilec; ++i)
+        n += snprintf(buf + n, sizeof(buf) - n, " %7.1lf", pctv[i] / 10.0);
+
+    printf("%s %*.1lf%s\n", buf, maxwidth, (last / 10.0), latmaxbuf);
+    fflush(stdout);
+
+    for (i = 0; i < jobs; ++i)
+        spfree(tdargv[i].spbuf, tdargv[i].spbufsz);
+
+    free(tdargv);
 
     if (itermax-- > 1)
         goto again;
 
-    spfree(tdargv, tdargvsz);
-    spfree(rxbuf, rxbufsz);
     auth_destroy(auth);
     free(host);
+    free(quantilebase);
 
     return 0;
 }
@@ -1107,8 +1276,9 @@ eprint(int err, const char *fmt, ...)
     n = vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    if (err && n >= 0 && n < sizeof(msg)) {
-        strerror_r(err, msg + n, sizeof(msg) - n);
+    if (err && n >= 0 && n < sizeof(msg) - 2) {
+        strlcat(msg, ": ", sizeof(msg) - n);
+        strerror_r(err, msg + n + 2, sizeof(msg) - n - 2);
     }
 
     fprintf(eprint_fp, "%s: %s\n", progname, msg);

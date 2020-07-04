@@ -36,6 +36,7 @@ of a kernel thread.
 * igb0: <Intel(R) PRO/1000
 * [Supermicro SYS-6028R-TRT] https://www.supermicro.com/en/products/system/2U/6028/SYS-6028R-TRT.cfm
 * X10DRi
+* FreeBSD 12.1-STABLE r362887 SM1 
 
 #### Server
 * Intel(R) Xeon(R) CPU E5-2690 v3 @ 2.60GHz
@@ -43,6 +44,7 @@ of a kernel thread.
 * ix0: <Intel(R) PRO/10GbE PCI-Express> (direct wired)
 * [Supermicro SYS-6028R-TRT] https://www.supermicro.com/products/system/2U/6028/SYS-6028R-TRT.cfm
 * X10DRi-T
+* FreeBSD 12.1-STABLE r362887 SM1 
 
 ### Results
 
@@ -59,47 +61,23 @@ and
 Measurements taken by *rpctest* are end-to-end and include the full time
 to encode each RPC call and decode/verify each RPC reply.
 
-* Latency is meausred in microseconds, single-threaded with 1 inflight request.
-For example: `sudo ./rpctest -j1 10.100.0.1`
+* Median latency measured in microseconds, single-threaded with at most one
+request in flight.  For example: `sudo ./rpctest 10.100.0.1`
 
   Gbe  |       Client     |       Server     |    Latency    |      RPC/ s     |  Misc  |
  :---: | :--------------: | :--------------: | :-----------: | :--------------:| :----: |
-  100  |  cc0, E5-2690v3  |  cc0, E5-2690v3  |  10.2 - 10.3  |  95237 - 96488  |   toe  |
-  100  |  cc1, E5-2690v3  |  cc1, E5-2690v3  |  12.3 - 12.6  |  78613 - 79603  |        |
-   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |  17.0 - 17.5  |  56524 - 58314  |        |
-   10  |  ix0, i7-5820K   |  ix0, X5690      |  33.6 - 34.2  |  30925 - 32159  |   pf?  |
+  100  |  cc0, E5-2690v3  |  cc0, E5-2690v3  |  10.3 - 10.5  |  94392 - 96524  |   toe  |
+  100  |  cc1, E5-2690v3  |  cc1, E5-2690v3  |  12.4 - 12.7  |  77968 - 78839  |        |
+   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |  16.9 - 17.4  |  56949 - 58428  |        |
 
-* Throughput is measured in RPC/sec, single-threaded with up to 16 requests
-in flight.  For exaple: `sudo ./rpctest -j1 -a16 -c3000000 10.100.0.1`
+* Median latency measured in microseconds, single-threaded with up to 128
+requests in flight.  For example: `sudo ./rpctest -j1 -a128 -c9M 10.100.0.1`
 
-  Gbe  |       Client     |       Server     |    LATENCY    |        RPC/s     |  Misc  |
- :---: | :--------------: | :--------------: | :-----------: | :---------------:| :----: |
-  100  |  cc0, E5-2690v3  |  cc0, E5-2690v3  |  22.6 - 28.4  |  571156 - 732787 |   toe  |
-  100  |  cc1, E5-2690v3  |  cc1, E5-2690v3  |  27.2 - 33.3  |  474537 - 588848 |        |
-   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |  40.1 - 40.0  |  390274 - 396127 |        |
-   10  |  ix0, i7-5820K   |  ix0, X5690      |  65.5 - 69.0  |  212395 - 221070 |   pf?  |
-
-* Throughput is measured in RPC/sec, single-threaded with up to 128 requests
-in flight.  For exaple: `sudo ./rpctest -j1 -a128 -c3000000 10.100.0.1`
-
-  Gbe  |       Client     |       Server     |      LATENCY    |        RPC/s     |  Misc  |
- :---: | :--------------: | :--------------: | :-------------: | :---------------:| :----: |
-  100  |  cc0, E5-2690v3  |  cc0, E5-2690v3  |  118.4 - 195.1  |  656110 - 682723 |   toe  |
-  100  |  cc1, E5-2690v3  |  cc1, E5-2690v3  |  131.8 - 191.4  |  692092 - 839525 |        |
-   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |   99.1 - 231.0  |  548832 - 830553 |        |
-   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |  108.2 - 252.2   | 524847 - 793985 |        |
-   10  |  ix0, i7-5820K   |  ix0, X5690      |  138.7 - 174.7  |  727922 - 909851 |   pf?  |
-
-* Throughput is measured in RPC/sec, multi-threaded (12 threads) with up to 224
-requests in flight.  For exaple: `sudo ./rpctest -j12 -a224 -c9000000 10.100.0.1`
-
-  Gbe  |       Client     |       Server     |     LATENCY     |        RPC/s       |  Misc  |
- :---: | :--------------: | :--------------: | :-------------: | :-----------------:| :----: |
-  100  |  cc0, E5-2690v3  |  cc0, E5-2690v3  |  344.3 - 353.4  |  6448889 - 7221718 |   TOE  |
-  100  |  cc1, E5-2690v3  |  cc1, E5-2690v3  |  343.2 - 372.5  |  5561946 - 6039291 |        |
-   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |  326.1 - 332.1  |  4712192 - 5065695 |        |
-   10  |  ix0, i7-5820K   |  ix0, X5690      |  428.2 - 548.9  |  3178040 - 4203666 |   pf?  |
-
+  Gbe  |       Client     |       Server     |     Latency     |        RPC/s      |  Misc  |
+ :---: | :--------------: | :--------------: | :-------------: | :---------------: | :----: |
+  100  |  cc0, E5-2690v3  |  cc0, E5-2690v3  |   90.0 - 186.5  |  620423 - 700183  |   toe  |
+  100  |  cc1, E5-2690v3  |  cc1, E5-2690v3  |  135.3 - 195.0  |  679476 - 847468  |        |
+   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |  103.7 - 168.2  |  764203 - 799662  |        |
 
 Given that the 100Gbe and 10Gbe tests are not bandwidth limited by the NICs,
 I suspect that both latency and throughput would improve given faster CPUs
@@ -160,6 +138,7 @@ dev.t6nex.0.toe.tx_zcopy=1
 ```
 
 #### /etc/rc.conf
+```
 powerd_enable="YES"
 powerd_flags="-n hiadaptive -a hiadaptive -p333 -i35 -r65"
 performance_cpu_freq="NONE"
@@ -171,14 +150,15 @@ ifconfig_cc0="inet 10.100.0.1 netmask 255.255.255.0 -tso -lro -vlanhwtso toe"
 ifconfig_cc1="inet 10.100.1.1 netmask 255.255.255.0 -tso -lro -vlanhwtso"
 ifconfig_ix0="inet 10.10.0.1 netmask 255.255.255.0 -tso -lro -vlanhwtso"
 ifconfig_ix1="inet 10.10.1.1 netmask 255.255.255.0 -tso -lro -vlanhwtso"
+```
 
 #### /boot/loader.conf
 
 ```
 cc_htcp_load="YES"
 if_cxgbe_load="YES"
-hw.cxgbe.nofldrxq="8"
-hw.cxgbe.nofldtxq="12"
+hw.cxgbe.nofldrxq="-8"
+hw.cxgbe.nofldtxq="-12"
 hw.cxgbe.fl_pktshift="2"
 hw.cxgbe.autoneg=0
 hw.ix.max_interrupt_rate="0"
@@ -196,4 +176,20 @@ hint.apic.0.clock=0
 hint.atrtc.0.clock=0
 coretemp_load="YES"
 
+```
+
+#### /sys/amd64/conf/SM1
+```
+include 	GENERIC
+ident		SM1
+
+options 	CONSPEED=115200
+options 	BREAK_TO_DEBUGGER
+options 	DDB
+
+#options 	SOCKBUF_DEBUG
+#options 	INVARIANTS
+#options 	INVARIANT_SUPPORT
+
+device 		cxgbe
 ```
