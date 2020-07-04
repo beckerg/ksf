@@ -64,20 +64,20 @@ to encode each RPC call and decode/verify each RPC reply.
 * Median latency measured in microseconds, single-threaded with at most one
 request in flight.  For example: `sudo ./rpctest 10.100.0.1`
 
-  Gbe  |       Client     |       Server     |    Latency    |      RPC/ s     |  Misc  |
- :---: | :--------------: | :--------------: | :-----------: | :--------------:| :----: |
-  100  |  cc0, E5-2690v3  |  cc0, E5-2690v3  |  10.3 - 10.5  |  94392 - 96524  |   toe  |
-  100  |  cc1, E5-2690v3  |  cc1, E5-2690v3  |  12.4 - 12.7  |  77968 - 78839  |        |
-   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |  16.9 - 17.4  |  56949 - 58428  |        |
+  Gbe |       Client   |      Server    |   Latency   |     RPC/ s     | Misc |
+  --- | -------------- | -------------- | ----------- | -------------- | ---- |
+  100 | cc0, E5-2690v3 | cc0, E5-2690v3 | 10.3 - 10.5 | 94392 - 96524  |  toe |
+  100 | cc1, E5-2690v3 | cc1, E5-2690v3 | 12.4 - 12.7 | 77968 - 78839  |      |
+   10 | ix0, E5-2690v3 | ix0, E5-2690v3 | 16.9 - 17.4 | 56949 - 58428  |      |
 
 * Median latency measured in microseconds, single-threaded with up to 128
 requests in flight.  For example: `sudo ./rpctest -j1 -a128 -c9M 10.100.0.1`
 
-  Gbe  |       Client     |       Server     |     Latency     |        RPC/s      |  Misc  |
- :---: | :--------------: | :--------------: | :-------------: | :---------------: | :----: |
-  100  |  cc0, E5-2690v3  |  cc0, E5-2690v3  |   90.0 - 186.5  |  620423 - 700183  |   toe  |
-  100  |  cc1, E5-2690v3  |  cc1, E5-2690v3  |  135.3 - 195.0  |  679476 - 847468  |        |
-   10  |  ix0, E5-2690v3  |  ix0, E5-2690v3  |  103.7 - 168.2  |  764203 - 799662  |        |
+  Gbe |       Client   |      Server    |     Latency   |        RPC/s     |  Misc |
+  --- | -------------- | -------------- | ------------- | ---------------- | ----- |
+  100 | cc0, E5-2690v3 | cc0, E5-2690v3 |  90.0 - 186.5 |  620423 - 700183 |  toe  |
+  100 | cc1, E5-2690v3 | cc1, E5-2690v3 | 135.3 - 195.0 |  679476 - 847468 |       |
+   10 | ix0, E5-2690v3 | ix0, E5-2690v3 | 103.7 - 168.2 |  764203 - 799662 |       |
 
 Given that the 100Gbe and 10Gbe tests are not bandwidth limited by the NICs,
 I suspect that both latency and throughput would improve given faster CPUs
