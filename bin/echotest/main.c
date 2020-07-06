@@ -338,7 +338,7 @@ run(void *arg)
     tdargs->cpu = ru_total.tv_sec * 1000000 + ru_total.tv_usec;
 
     dprint(1, "%p, fd %2d, usecs %ld, cpu %ld %.2lf, msgs/sec %ld, MBps %.2lf, Gbps %.2lf, %ld %ld\n",
-           tdargs->td, fd, usecs,
+           (void *)tdargs->td, fd, usecs,
            tdargs->cpu, (double)tdargs->cpu / tdargs->iters,
            (tdargs->iters * 1000000) / usecs,
            bytespersec / (1ul << 20),

@@ -1,6 +1,6 @@
-## knsf - Kernel Network Service Framework for FreeBSD
+## ksf - Kernel Sockets Framework for FreeBSD
 
-*knsf* is a lightweight kernel network service framework for the purpose
+*ksf* is a lightweight kernel network service framework for the purpose
 of building simple network services that run in the FreeBSD kernel.
 The motivation for this project was to build some generally useful RPC
 handling software that is capable of both low-latency and high throughput,
@@ -8,7 +8,7 @@ yet does not sacrifice generality (i.e., it does not cut corners for the
 purpose of achieving better benchmarks).
 
 ### Contents
-The *knsf* repo includes two reference service implementations:
+The *ksf* repo includes two reference service implementations:
 1. *kecho* is a loadable kernel module that implements an echo server which
 simply echos back every byte of data that arrives on its receive queue
 2. *krpc2* is a loadable kernel module that implements an RPC server which
@@ -19,12 +19,12 @@ services and measure the resulting latency and throughput (*echotest* and *rpcte
 
 ### Implementation
 #### Abstractions
-*knsf* provides two primary kernel abstractions: The connection (**struct conn**)
+*ksf* provides two primary kernel abstractions: The connection (**struct conn**)
 which manages a single socket, and the service (**struct svc**) which manages
 a collection of connections.
 
 #### Thread Pool
-*knsf* provides a thread pool for the purpose of running short-lived asynchronous
+*ksf* provides a thread pool for the purpose of running short-lived asynchronous
 tasks affined to a specific core.  All such tasks are executed in the context
 of a kernel thread.
 

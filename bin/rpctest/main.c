@@ -148,6 +148,7 @@ char *auth_type = "none";
 AUTH *auth;
 char *host;
 bool udp;
+char *datadir;
 
 double nsecspercycle;
 double quantilev[16];
@@ -196,6 +197,7 @@ static clp_option_t optionv[] = {
     CLP_OPTION(size_t, 'a', msginf, NULL, NULL, "max number of inflight RPCs (per thread)"),
     CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "max messages to send (per thread)"),
     CLP_OPTION(bool, 'f', fragged, NULL, NULL, "break each RPC into three records"),
+    CLP_OPTION(string, 'd', datadir, NULL, NULL, "latency data output directory"),
     CLP_OPTION(bool, 'H', headers, NULL, NULL, "suppress headers"),
     CLP_OPTION(u_int, 'i', itermax, NULL, NULL, "max iterations"),
     CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of threads/connections"),
@@ -774,6 +776,7 @@ main(int argc, char **argv)
     struct tdargs *tdargv;
     struct hostent *hent;
     char *server, *user;
+    u_int loops;
     int i, j;
 
     int cpu_count, cpu_offset, cpu_step;
@@ -1017,6 +1020,7 @@ main(int argc, char **argv)
         msgcntwidth = 7;
 
     maxwidth = 8;
+    loops = 0;
 
   again:
     tdargv = calloc(jobs, sizeof(*tdargv));
@@ -1228,12 +1232,81 @@ main(int argc, char **argv)
     printf("%s %*.1lf%s\n", buf, maxwidth, (last / 10.0), latmaxbuf);
     fflush(stdout);
 
+    if (datadir) {
+        char datafile[1024], gplotfile[1024], pngfile[1024];
+        char cmd[1024 + 32];
+        FILE *fp;
+
+        snprintf(gplotfile, sizeof(gplotfile), "%s/%s.%u.gnuplot", datadir, progname, loops);
+        snprintf(datafile, sizeof(datafile), "%s/%s.%u.data", datadir, progname, loops);
+        snprintf(pngfile, sizeof(pngfile), "%s/%s.%u.png", datadir, progname, loops);
+
+        mkdir(datadir, 0755);
+
+        fp = fopen(datafile, "w");
+        if (fp) {
+            for (j = jmin; j < jmax; ++j) {
+                if (tdargv[0].bktv[j] > 0) {
+                    nsecs = cycles2nsecs(j << tsc_scale);
+                    fprintf(fp, "%12ld  %u\n", nsecs, tdargv[0].bktv[j]);
+                }
+            }
+            fclose(fp);
+
+            fp = fopen(gplotfile, "w");
+            if (fp) {
+                const char *using = "($1 / 1000.0):($2)";
+                const char *xlabel = "microseconds";
+                const char *ylabel = "hits";
+                const char *color = "orange";
+                const char *term = "png";
+                long pctmin = first / 10;
+                long pctmax = last / 10;
+
+                if (quantilec > 1) {
+                    pctmax = pctv[quantilec - 1] / 10;
+                    pctmin = pctv[0] / 10;
+                }
+                if (pctmax > 1000)
+                    pctmax = 1000;
+
+                fprintf(fp, "set title \"%s -j%u -a%zu -c%lu (loop %u)\"\n",
+                        progname, jobs, msginf, msgcnt, loops);
+                fprintf(fp, "set output '%s'\n", pngfile);
+                fprintf(fp, "set term %s size 2560,768\n", term);
+                fprintf(fp, "set autoscale\n");
+                fprintf(fp, "set grid\n");
+                fprintf(fp, "set xlabel \"%s\"\n", xlabel);
+                fprintf(fp, "set xtics autofreq\n");
+                fprintf(fp, "set xrange [%ld:%ld]\n", pctmin, pctmax);
+                fprintf(fp, "set ylabel \"%s\"\n", ylabel);
+                fprintf(fp, "set ytics autofreq\n");
+                fprintf(fp, "set tics front\n");
+
+                fprintf(fp, "plot \"%s\" using %s "
+                        "with impulses lc rgbcolor \"%s\" "
+                        "title \"latency %u\"\n",
+                        datafile, using, color, loops);
+
+                fclose(fp);
+
+                snprintf(cmd, sizeof(cmd), "gnuplot %s", gplotfile);
+                fp = popen(cmd, "r");
+                if (!fp) {
+                    eprint(errno, "[%s] failed\n", cmd);
+                } else {
+                    pclose(fp);
+                }
+            }
+        }
+    }
+
     for (i = 0; i < jobs; ++i)
         spfree(tdargv[i].spbuf, tdargv[i].spbufsz);
 
     free(tdargv);
 
-    if (itermax-- > 1)
+    if (++loops < itermax)
         goto again;
 
     auth_destroy(auth);
