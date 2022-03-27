@@ -51,20 +51,82 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 #include <rpc/types.h>
 #include <rpc/auth.h>
 #include <rpc/rpc.h>
 
-#ifdef __FreeBSD__
+#if __FreeBSD__
+#include <pthread_np.h>
+#include <sys/endian.h>
+#include <rpcsvc/nfs_prot.h>
 #include <sys/sysctl.h>
+#include <sys/cpuset.h>
+
+#elif __linux__
+
+#include <sched.h>
+#include <endian.h>
+#include <linux/nfs.h>
+
+#define MAP_ALIGNED_SUPER   MAP_HUGETLB
+#define CACHE_LINE_SIZE     (64)
+#define cpuset_t            cpu_set_t
+
+#if HAVE_TSC
+#define __rdtsc()           __builtin_ia32_rdtsc()
+#endif
+
+#define CPU_COPY(_src, _dst)        \
+do {                                \
+    CPU_ZERO((_dst));               \
+    CPU_OR((_dst), (_src), (_src)); \
+} while (0)
+
+size_t __attribute__((__weak__))
+strlcat(char *dst, const char *src, size_t dstsize)
+{
+    return strlen(strcat(dst, src)); // TODO...
+}
+#endif
+
+/* SPALIGN     Superpage alignment
+ * BKTV_MAX    Max buckets in latency histogram
+ * MSGINF_MAX  Max messages in flight per thread
+ * MSGSZ_MAX   Max rx/tx message size
+ */
+#define SPALIGN             (1024 * 1024 * 2ul)
+#define BKTV_MAX            (1024 * 1024 * 8ul)
+#define MSGINF_MAX          (1024)
+#define MSGSZ_MAX           (128)
+#define NFS3_NULL           (0)
+
+#define NELEM(_a)           (sizeof(_a) / sizeof((_a)[0]))
+
+#ifndef __read_mostly
+#define __read_mostly       __attribute__((__section__(".read_mostly")))
+#endif
+
+#ifndef likely
+#define likely(_expr)       __builtin_expect(!!(_expr), 1)
+#endif
+
+#ifndef __aligned
+#define __aligned(_sz)      __attribute__((__aligned__(_sz)))
 #endif
 
 #include "main.h"
 #include "clp.h"
 
-#define MSGLAG_MAX  (1024)
+/* Time-stamp interval type...
+ */
+#if HAVE_TSC
+typedef uint64_t            tsi_t;
+#else
+typedef struct timespec     tsi_t;
+#endif
 
 char version[] = PROG_VERSION;
 char *progname;
@@ -75,26 +137,36 @@ FILE *eprint_fp;
 
 pthread_barrier_t bar_start;
 pthread_barrier_t bar_end;
+u_int itermax = UINT_MAX;
 unsigned int jobs = 1;
 in_port_t port = 60007;
-u_long msgcnt = 1000000;
-size_t msglag = 1;
 size_t msglen = 1;
 char *host;
+bool headers = true;
 bool async;
 bool udp;
+
+double nsecspercycle;
+
+u_long msgcnt __read_mostly;
+size_t msginf __read_mostly;
+uint tsc_scale __read_mostly;
+uint64_t tsc_freq __read_mostly;
 
 struct tdargs {
     struct sockaddr_in faddr;
     pthread_t td;
+    size_t spbufsz;
+    size_t rxbufsz;
+    char *spbuf;
     char *rxbuf;
+    tsi_t *startv;
     long iters;
     long usecs;
     long cpu;
     long tx_eagain;
     long rx_eagain;
-    uint64_t latency;
-    uint64_t startv[MSGLAG_MAX];
+    long latency;
 };
 
 static clp_posparam_t posparamv[] = {
@@ -110,8 +182,10 @@ static clp_option_t optionv[] = {
     CLP_OPTION_VERSION(version),
     CLP_OPTION_HELP,
 
-    CLP_OPTION(size_t, 'a', msglag, NULL, NULL, "max number of inflight msgs (per thread)"),
+    CLP_OPTION(size_t, 'a', msginf, NULL, NULL, "max number of inflight msgs (per thread)"),
     CLP_OPTION(u_long, 'c', msgcnt, NULL, NULL, "max messages to send (per thread)"),
+    CLP_OPTION(bool, 'H', headers, NULL, NULL, "suppress headers"),
+    CLP_OPTION(u_int, 'i', itermax, NULL, NULL, "max iterations"),
     CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of threads/connections"),
     CLP_OPTION(size_t, 'l', msglen, NULL, NULL, "message length"),
     CLP_OPTION(uint16_t, 'p', port, NULL, NULL, "remote port"),
@@ -120,19 +194,93 @@ static clp_option_t optionv[] = {
     CLP_OPTION_END
 };
 
+static uint64_t
+cycles2nsecs(uint64_t cycles)
+{
+    return cycles * nsecspercycle;
+}
+
+/* Record the start time for a time stamp interval measurement.
+ */
+static inline void
+tsi_start(tsi_t *start)
+{
+#if HAVE_TSC
+    *start = __rdtsc();
+#else
+    clock_gettime(CLOCK_MONOTONIC, start);
+#endif
+}
+
+/* Return the difference in time between the current time
+ * and the given earlier time stamp.  Always returns "cycles"
+ * which can be converted to nanoseconds via cycles2nsecs().
+ */
+static inline uint64_t
+tsi_delta(tsi_t *start)
+{
+#if HAVE_TSC
+    return __rdtsc() - *start;
+#else
+    struct timespec now;
+
+    clock_gettime(CLOCK_MONOTONIC, &now);
+
+    timespecsub(&now, start, &now);
+
+    return now.tv_sec * 1000000000ul + now.tv_nsec;
+#endif
+}
+
+/* Allocate one or more superpages.  Falls back to normal
+ * pages if superpages cannot be allocated.
+ */
+void *
+spalloc(size_t sz)
+{
+    int flags = MAP_SHARED | MAP_ANON;
+    int prot = PROT_READ | PROT_WRITE;
+    int super = MAP_ALIGNED_SUPER;
+    void *mem;
+
+    sz = roundup(sz, 1024 * 1024 * 2);
+
+  again:
+    mem = mmap(NULL, sz, prot, flags, -1, 0);
+
+    if (mem == MAP_FAILED) {
+        if (super) {
+            super = 0;
+            goto again;
+        }
+    }
+
+    if (!super)
+        dprint(1, "unable to mmap %zu superpages\n", sz / SPALIGN);
+
+    return (mem == MAP_FAILED) ? NULL : mem;
+}
+
+int
+spfree(void *mem, size_t sz)
+{
+    return munmap(mem, roundup(sz, 1024 * 1024 * 2));
+}
 
 /* Asynchronous send/recv loop.  Note that the send can race ahead
- * of the receiver by at most msglag messages.
+ * of the receiver by at most msginf messages.
  */
 int
 test_async(int fd, struct tdargs *tdargs)
 {
-    char *rxbuf, *txbuf, errbuf[128];
     ssize_t rxlen, txlen, txfrag, txfragmax, cc;
     int rxflags, txflags;
+    char *rxbuf, *txbuf;
     long msgrx, msgtx;
+    tsi_t *startv;
     int rc;
 
+    startv = tdargs->startv;
     rxbuf = tdargs->rxbuf;
     txbuf = rxbuf + roundup(msglen, 4096);
     txflags = MSG_DONTWAIT;
@@ -149,12 +297,14 @@ test_async(int fd, struct tdargs *tdargs)
     txfrag = txfragmax;
 
     while (msgrx < msgcnt) {
-        if (msgtx < msgcnt && msgtx - msgrx < msglag) {
+        if (msgtx < msgcnt && msgtx - msgrx < msginf) {
+            if (txlen == msglen)
+                tsi_start(&startv[msgtx % MSGINF_MAX]);
+
             cc = send(fd, txbuf + (txfragmax - txfrag), txfrag, txflags);
             if (cc == -1) {
                 if (errno != EAGAIN) {
-                    strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                    eprint("send: cc %ld: %s\n", cc, errbuf);
+                    eprint(rc = errno, "send: cc %ld", cc);
                     break;
                 }
 
@@ -176,13 +326,12 @@ test_async(int fd, struct tdargs *tdargs)
             }
         }
 
-        rxflags = (msgtx < msgcnt && msgtx - msgrx < msglag) ? MSG_DONTWAIT : MSG_WAITALL;
+        rxflags = (msgtx < msgcnt && msgtx - msgrx < msginf) ? MSG_DONTWAIT : MSG_WAITALL;
 
         cc = recv(fd, rxbuf + (msglen - rxlen), rxlen, rxflags);
         if (cc == -1) {
             if (errno != EAGAIN) {
-                strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("recv: cc %ld %s\n", cc, errbuf);
+                eprint(rc = errno, "recv: cc %ld", cc);
                 break;
             }
 
@@ -192,6 +341,7 @@ test_async(int fd, struct tdargs *tdargs)
 
         rxlen -= cc;
         if (rxlen == 0) {
+            tdargs->latency += tsi_delta(&startv[msgrx % MSGINF_MAX]);
             rxlen = msglen;
             ++msgrx;
         }
@@ -224,11 +374,11 @@ test_sync(int fd, struct tdargs *tdargs)
         if (cc != msglen) {
             if (cc == -1) {
                 strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("send: cc %ld: %s\n", cc, errbuf);
+                eprint(rc = errno, "send: cc %ld", cc);
                 break;
             }
 
-            eprint("sendto: cc %ld: short write\n", cc);
+            eprint(EIO, "sendto: cc %ld: short write", cc);
             rc = EIO;
             break;
         }
@@ -237,12 +387,11 @@ test_sync(int fd, struct tdargs *tdargs)
 
         if (cc != msglen) {
             if (cc == -1) {
-                strerror_r(rc = errno, errbuf, sizeof(errbuf));
-                eprint("recv: cc %ld %s\n", cc, errbuf);
+                eprint(rc = errno, "recv: cc %ld", cc);
                 break;
             }
 
-            eprint("recvfrom: cc %ld short read\n", cc);
+            eprint(EIO, "recvfrom: cc %ld short read", cc);
             rc = EIO;
             break;
         }
@@ -255,59 +404,80 @@ test_sync(int fd, struct tdargs *tdargs)
 void *
 run(void *arg)
 {
-    char errbuf[128];
-    struct timeval tv_start, tv_stop, tv_diff;
     struct timeval ru_utime, ru_stime, ru_total;
     struct rusage ru_start, ru_stop;
     struct tdargs *tdargs = arg;
     double bytespersec;
     long usecs;
-    int optval;
     int fd, rc;
+    int optval;
+    tsi_t tsi;
+
+    /* Reschedule to ensure we awaken on the desired CPU...
+     */
+    usleep(10000);
 
     fd = socket(PF_INET, udp ? SOCK_DGRAM : SOCK_STREAM, 0);
     if (fd == -1) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("socket: %s\n", errbuf);
+        eprint(errno, "socket");
         abort();
     }
 
     rc = connect(fd, (struct sockaddr *)&tdargs->faddr, sizeof(tdargs->faddr));
     if (rc) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("connect: %s\n", errbuf);
+        eprint(errno, "connect");
         abort();
     }
 
     optval = msglen;
     rc = setsockopt(fd, SOL_SOCKET, SO_RCVLOWAT, &optval, sizeof(optval));
     if (rc) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("setsockopt(SO_RCVLOWAT): %s\n", errbuf);
+        eprint(errno, "setsockopt(SO_RCVLOWAT)");
         abort();
     }
 
     /* Make the send buffer large enough so that send() wont block..
      */
-    if (msglen * msglag > 16 * 1024) {
-        optval = msglen * msglag;
+    if (msglen * msginf > 16 * 1024) {
+        optval = roundup(msglen * msginf, 4096);
+
         rc = setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &optval, sizeof(optval));
         if (rc) {
-            strerror_r(errno, errbuf, sizeof(errbuf));
-            eprint("setsockopt(SO_SNDBUF): %s\n", errbuf);
+            eprint(errno, "setsockopt(SO_SNDBUF)");
             abort();
         }
     }
 
     if (msglen > 16 * 1024) {
-        optval = msglen * 2;
+        optval = roundup(msglen * 2, 4096);
+
         rc = setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &optval, sizeof(optval));
         if (rc) {
-            strerror_r(errno, errbuf, sizeof(errbuf));
-            eprint("setsockopt(SO_RCVBUF): %s\n", errbuf);
+            eprint(errno, "setsockopt(SO_RCVBUF)");
             abort();
         }
     }
+
+    if (msginf == 1) {
+        optval = 1;
+
+        rc = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval));
+        if (rc)
+            eprint(errno, "setsockopt(TCP_NODELAY)");
+    }
+
+    tdargs->rxbufsz = roundup(msglen, 4096) * 2;
+    tdargs->spbufsz += sizeof(tdargs->startv[0]) * MSGINF_MAX;
+
+    tdargs->spbuf = spalloc(tdargs->spbufsz);
+    if (!tdargs->spbuf) {
+        eprint(errno, "spalloc spbuf %zu", tdargs->spbufsz);
+        abort();
+    }
+
+    memset(tdargs->spbuf, 0, tdargs->spbufsz);
+    tdargs->rxbuf = tdargs->spbuf;
+    tdargs->startv = (tsi_t *)(tdargs->spbuf + tdargs->rxbufsz);
 
     errno = 0;
     rc = pthread_barrier_wait(&bar_start);
@@ -315,20 +485,18 @@ run(void *arg)
         abort();
 
     getrusage(RUSAGE_SELF, &ru_start);
-    gettimeofday(&tv_start, NULL);
+    tsi_start(&tsi);
 
-    if (msglag > 0)
+    if (msginf > 0)
         rc = test_async(fd, tdargs);
     else
         rc = test_sync(fd, tdargs);
 
-    gettimeofday(&tv_stop, NULL);
+    usecs = cycles2nsecs(tsi_delta(&tsi)) / 1000;
     getrusage(RUSAGE_SELF, &ru_stop);
 
     pthread_barrier_wait(&bar_end);
 
-    timersub(&tv_stop, &tv_start, &tv_diff);
-    usecs = tv_diff.tv_sec * 1000000 + tv_diff.tv_usec;
     bytespersec = (msglen * tdargs->iters * 1000000) / usecs;
     tdargs->usecs = usecs;
 
@@ -367,10 +535,9 @@ main(int argc, char **argv)
     struct hostent *hent;
     char *server, *user;
     double bytespersec;
-    size_t tdargvsz;
-    size_t rxbufsz;
-    char *rxbuf;
-    long *prxbuf;
+    uint64_t latency;
+    long nsecs;
+    u_int loops;
     int i;
 
     char errbuf[128];
@@ -382,19 +549,73 @@ main(int argc, char **argv)
     progname = strrchr(argv[0], '/');
     progname = (progname ? progname + 1 : argv[0]);
 
+    initstate((u_long)time(NULL), state, sizeof(state));
     dprint_fp = stderr;
     eprint_fp = stderr;
+    msgcnt = 1000000;
+    msginf = 1;
 
-    initstate((u_long)time(NULL), state, sizeof(state));
+
+#if HAVE_TSC
+#if __FreeBSD__
+    uint64_t val = 0;
+    size_t valsz = sizeof(val);
+
+    rc = sysctlbyname("kern.timecounter.smp_tsc", (void *)&val, &valsz, NULL, 0);
+    if (rc) {
+        eprint(errno, "sysctlbyname(kern.timecounter.smp_tsc)");
+    } else if (val) {
+        valsz = sizeof(val);
+        val = 0;
+
+        rc = sysctlbyname("machdep.tsc_freq", (void *)&val, &valsz, NULL, 0);
+        if (rc) {
+            eprint(errno, "sysctlbyname(machdep.tsc_freq)");
+        } else {
+            tsc_freq = val;
+        }
+    }
+#elif __linux__
+    const char cmd[] = "lscpu | sed -En 's/^Model name.*([0-9]\\.[0-9][0-9])GHz$/\\1/p'";
+    char line[32];
+    FILE *fp;
+
+    fp = popen(cmd, "r");
+    if (fp) {
+        if (fgets(line, sizeof(line), fp)) {
+            tsc_freq = strtod(line, NULL) * 1000000000;
+        }
+        pclose(fp);
+    }
+#endif
+
+    if (tsc_freq < 1000000) {
+        eprint(0, "unable to determine TSC frequency, disable HAVE_TSC in GNUmakefile to use clock_gettime()");
+        exit(EX_UNAVAILABLE);
+    }
+
+#else
+    tsc_freq = 1000000000;
+#endif
+
 
     rc = clp_parsev(argc, argv, optionv, posparamv, errbuf, sizeof(errbuf), &optind);
     if (rc) {
-        eprint("%s\n", errbuf);
+        eprint(0, "%s", errbuf);
         exit(rc);
     }
 
     if (given('h') || given('V'))
         return 0;
+
+    nsecspercycle = 1000000000.0 / tsc_freq;
+    tsc_scale += (tsc_freq / 1000000000) + (jobs > 2);
+
+    nsecs = cycles2nsecs(1u << tsc_scale);
+    //latprec = (nsecs < 10) ? 2 : (nsecs < 100 ? 1 : 0);
+
+    dprint(1, "tsc_freq %lu, tsc_scale %u, nsecs/cycle %lf, histres %luns\n",
+           tsc_freq, tsc_scale, nsecspercycle, nsecs);
 
     argc -= optind;
     argv += optind;
@@ -414,7 +635,7 @@ main(int argc, char **argv)
     }
 
     if (!isalpha(server[0]) && !isdigit(server[0])) {
-        eprint("invalid host name %s\n", server);
+        eprint(0, "invalid host name %s", server);
         exit(1);
     }
 
@@ -423,19 +644,19 @@ main(int argc, char **argv)
 
     hent = gethostbyname(server);
     if (!hent) {
-        eprint("gethostbyname(%s) failed: %s\n", server, hstrerror(h_errno));
+        eprint(h_errno, "gethostbyname(%s) failed", server);
         exit(1);
     }
 
     if (hent->h_addrtype != AF_INET) {
-        eprint("host %s does not have an AF_INET address\n", server);
+        eprint(0, "host %s does not have an AF_INET address", server);
         exit(1);
     }
 
     if (!inet_ntop(AF_INET, hent->h_addr_list[0],
                    serverip, sizeof(serverip))) {
-        eprint("unable to convert server address %s to dotted quad notation: %s",
-               server, strerror(errno));
+        eprint(errno, "unable to convert server address %s to dotted quad notation",
+               server);
         exit(1);
     }
 
@@ -443,68 +664,12 @@ main(int argc, char **argv)
     faddr.sin_addr.s_addr = inet_addr(serverip);
 
 
-#ifdef USE_TSC
-#ifdef __FreeBSD__
-    size_t sz = sizeof(tsc_freq);
-    int ival;
-
-    sz = sizeof(ival);
-    rc = sysctlbyname("kern.timecounter.smp_tsc", (void *)&ival, &sz, NULL, 0);
-    if (rc) {
-        eprint("sysctlbyname(kern.timecounter.smp_tsc): %s\n", strerror(errno));
-        exit(EX_OSERR);
-    }
-
-    if (!ival) {
-        dprint(0, "unable to determine if the TSC is SMP safe, "
-               "output will likely be incorrect\n");
-    }
-
-    sz = sizeof(tsc_freq);
-    rc = sysctlbyname("machdep.tsc_freq", (void *)&tsc_freq, &sz, NULL, 0);
-    if (rc) {
-        eprint("sysctlbyname(machdep.tsc_freq): %s\n", strerror(errno));
-        exit(EX_OSERR);
-    }
-
-    dprint(1, "machedep.tsc_freq: %lu\n", tsc_freq);
-#else
-#error "Don't know how to determine the TSC frequency on this platform"
-#endif
-#endif
-
     if (msgcnt < 1)
         msgcnt = 1;
     if (msglen < 1)
         msglen = 1;
-    if (msglag > MSGLAG_MAX)
-        msglag = MSGLAG_MAX;
-
-    rxbufsz = roundup(msglen, 4096) * 2 * jobs;
-    rxbufsz = roundup(rxbufsz, 1024 * 1024 * 2);
-
-    rxbuf = mmap(NULL, rxbufsz, PROT_READ | PROT_WRITE,
-                 MAP_ALIGNED_SUPER | MAP_SHARED | MAP_ANON, -1, 0);
-    if (rxbuf == MAP_FAILED) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("mmap: %s\n", errbuf);
-        abort();
-    }
-
-    prxbuf = (long *)rxbuf;
-    for (i = 0; i < rxbufsz / sizeof(*prxbuf); i += sizeof(*prxbuf))
-        *prxbuf++ = (long)(rxbuf + i);
-
-    tdargvsz = roundup(sizeof(*tdargv) * jobs, 4096);
-    tdargvsz = roundup(tdargvsz, 1024 * 1024 * 2);
-
-    tdargv = mmap(NULL, tdargvsz, PROT_READ | PROT_WRITE,
-                  MAP_ALIGNED_SUPER | MAP_SHARED | MAP_ANON, -1, 0);
-    if (tdargv == MAP_FAILED) {
-        strerror_r(errno, errbuf, sizeof(errbuf));
-        eprint("mmap: %s\n", errbuf);
-        abort();
-    }
+    if (msginf > MSGINF_MAX)
+        msginf = MSGINF_MAX;
 
     rc = pthread_barrier_init(&bar_start, NULL, jobs);
     if (rc)
@@ -516,24 +681,33 @@ main(int argc, char **argv)
 
     rc = setpriority(PRIO_PROCESS, 0, -15);
     if (rc && errno != EACCES) {
-        eprint("unable to set priority: %s\n", strerror(errno));
+        eprint(errno, "unable to set priority");
+    }
+
+    loops = 0;
+
+  again:
+    tdargv = calloc(jobs, sizeof(tdargv[0]));
+    if (!tdargv) {
+        strerror_r(errno, errbuf, sizeof(errbuf));
+        eprint(errno, "spalloc tdargv");
+        abort();
     }
 
     for (i = 0; i < jobs; ++i) {
         struct tdargs *tdargs = tdargv + i;
 
-        memset(tdargs, 0, sizeof(*tdargs));
         memcpy(&tdargs->faddr, &faddr, sizeof(tdargs->faddr));
-        tdargs->rxbuf = rxbuf + roundup(msglen, 4096) * 2 * i;
 
         rc = pthread_create(&tdargs->td, NULL, run, tdargs);
         if (rc) {
-            eprint("pthread_create() failed: %s\n", strerror(errno));
+            eprint(rc, "pthread_create %d of %u", i, jobs);
             abort();
         }
     }
 
     usecs = iters = cpu = 0;
+    latency = 0;
 
     for (i = 0; i < jobs; ++i) {
         struct tdargs *tdargs = tdargv + i;
@@ -544,21 +718,35 @@ main(int argc, char **argv)
         iters += tdargs->iters;
         usecs += tdargs->usecs;
         cpu += tdargs->cpu;
+        latency += tdargs->latency;
+
+        spfree(tdargs->spbuf, tdargs->spbufsz);
     }
+
+    latency = cycles2nsecs(latency) / iters;
 
     usecs /= jobs;
     bytespersec = (msglen * iters * 1000000.0) / usecs;
 
-    dprint(0, "total: iters %ld, usecs %ld, cpu %ld, msgs/sec %ld, avglat %.1lf, MBps %.2lf, Gbps %.2lf, cpu/msg %.2lf\n",
-           iters, usecs, cpu,
-           (iters * 1000000) / usecs,
-           (double)usecs * jobs / iters,
-           bytespersec / (1ul << 20),
-           (bytespersec * 8) / 1000000000,
-           (double)cpu / iters);
+    if (headers) {
+        printf("%10s %10s %10s %7s %7s %7s\n",
+               "totmsgs", "totusecs", "msgs/sec", "avglat", "Mbps", "cpu/msg");
+        headers = false;
+    }
 
-    munmap(tdargv, tdargvsz);
-    munmap(rxbuf, rxbufsz);
+    printf("%10ld %10ld %10ld %7.1lf %7.2lf %7.2lf\n",
+           iters, usecs,
+           (iters * 1000000) / usecs,
+           latency / 1000.0,
+           (bytespersec * 8) / 1000000,
+           (double)cpu / iters);
+    fflush(stdout);
+
+    free(tdargv);
+
+    if (++loops < itermax)
+        goto again;
+
     free(host);
 
     return 0;
@@ -577,7 +765,7 @@ dprint_func(int lvl, const char *func, int line, const char *fmt, ...)
     vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    if (verbosity > 1)
+    if (verbosity > 2)
         fprintf(dprint_fp, "%s: %16s %4d:  %s", progname, func, line, msg);
     else
         fprintf(dprint_fp, "%s", msg);
@@ -587,14 +775,20 @@ dprint_func(int lvl, const char *func, int line, const char *fmt, ...)
 /* Error print.
  */
 void
-eprint(const char *fmt, ...)
+eprint(int err, const char *fmt, ...)
 {
     char msg[256];
     va_list ap;
+    int n;
 
     va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
+    n = vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
 
-    fprintf(eprint_fp, "%s: %s", progname, msg);
+    if (err && n >= 0 && n < sizeof(msg) - 2) {
+        strlcat(msg, ": ", sizeof(msg) - n);
+        strerror_r(err, msg + n + 2, sizeof(msg) - n - 2);
+    }
+
+    fprintf(eprint_fp, "%s: %s\n", progname, msg);
 }

@@ -49,9 +49,9 @@ of a kernel thread.
 ### Results
 
 The following results were obtained by running *rpctest* on the client,
-which never issues more than one RPC per call to
+which never issues more than one RPC (NFS NULL proc) per call to
 [send(2)](https://www.freebsd.org/cgi/man.cgi?query=send&sektion=2),
-and never receives more than one RPC per call to
+and never retrieves more than one RPC per call to
 [recv(2)](https://www.freebsd.org/cgi/man.cgi?query=recv&sektion=2)
 (per thread).  The RPC server, however, is free to send and receive more
 than one RPC request per call to both
@@ -61,23 +61,40 @@ and
 Measurements taken by *rpctest* are end-to-end and include the full time
 to encode each RPC call and decode/verify each RPC reply.
 
-* Median latency measured in microseconds, single-threaded with at most one
-request in flight.  For example: `sudo ./rpctest 10.100.0.1`
+* Median RTT latency in microseconds, single-threaded with at most one
+request in flight.
+For example: `sudo ./rpctest 10.100.0.1`
 
-  Gbe |       Client   |      Server    |   Latency   |     RPC/ s     | Misc |
-  --- | -------------- | -------------- | ----------- | -------------- | ---- |
-  100 | cc0, E5-2690v3 | cc0, E5-2690v3 | 10.3 - 10.5 | 94392 - 96524  |  toe |
-  100 | cc1, E5-2690v3 | cc1, E5-2690v3 | 12.4 - 12.7 | 77968 - 78839  |      |
-   10 | ix0, E5-2690v3 | ix0, E5-2690v3 | 16.9 - 17.4 | 56949 - 58428  |      |
+  Gbe |      Client    |      Server    |  RTT  | RPC/s | Misc |
+  --- | -------------- | -------------- | ----- | ----- | ---- |
+  100 | cc0, E5-2690v3 | cc0, E5-2690v3 |  10.4 | 94833 |  toe |
+  100 | cc1, E5-2690v3 | cc1, E5-2690v3 |  12.7 | 78152 |      |
+   10 | ix0, E5-2690v3 | ix0, E5-2690v3 |  17.3 | 57397 |      |
 
-* Median latency measured in microseconds, single-threaded with up to 128
-requests in flight.  For example: `sudo ./rpctest -j1 -a128 -c9M 10.100.0.1`
+* Median RTT latency in microseconds, single-threaded with up to 128
+requests in flight.
+For example: `sudo ./rpctest -j1 -a128 -c9M 10.100.0.1`
 
-  Gbe |       Client   |      Server    |     Latency   |        RPC/s     |  Misc |
-  --- | -------------- | -------------- | ------------- | ---------------- | ----- |
-  100 | cc0, E5-2690v3 | cc0, E5-2690v3 |  90.0 - 186.5 |  620423 - 700183 |  toe  |
-  100 | cc1, E5-2690v3 | cc1, E5-2690v3 | 135.3 - 195.0 |  679476 - 847468 |       |
-   10 | ix0, E5-2690v3 | ix0, E5-2690v3 | 103.7 - 168.2 |  764203 - 799662 |       |
+  Gbe |      Client    |      Server    |  RTT  |  RPC/s |  Misc |
+  --- | -------------- | -------------- | ----- | ------ | ----- |
+  100 | cc0, E5-2690v3 | cc0, E5-2690v3 | 163.5 | 665310 |  toe  |
+  100 | cc1, E5-2690v3 | cc1, E5-2690v3 | 167.0 | 731182 |       |
+   10 | ix0, E5-2690v3 | ix0, E5-2690v3 | 159.5 | 787885 |       |
+
+* Median RTT latency in microseconds, eight threads with up to 128
+requests in flight (per thread).
+For example: `sudo ./rpctest -j12 -a224 -c9M 10.100.0.1`
+
+  Gbe |       Client   |      Server    |  RTT  |  RPC/s  |  Misc |
+  --- | -------------- | -------------- | ----- | ------- | ----- |
+  100 | cc0, E5-2690v3 | cc0, E5-2690v3 | 413.2 | 6259603 |  toe  |
+  100 | cc1, E5-2690v3 | cc1, E5-2690v3 | 383.7 | 5240423 |       |
+   10 | ix0, E5-2690v3 | ix0, E5-2690v3 | 343.1 | 4761223 |       |
+
+Note that the *RTT* and *RPC/s* columns are the median of the all results
+over 99 runs (each of which is the median of all jobs within the run).
+This helps to mitigate the effects of non-deterministic flow affinity
+and other anomalies.
 
 Given that the 100Gbe and 10Gbe tests are not bandwidth limited by the NICs,
 I suspect that both latency and throughput would improve given faster CPUs

@@ -18,19 +18,15 @@ LDLIBS	:= -pthread
 
 VPATH	:= ../../lib
 
-# Uncomment USE_TSC if you have a P-state invariant TSC that is synchronized
-# across all cores.  By default we use gettimeofday().
-#
-#CDEFS	+= -DUSE_TSC
-
-
-# You probably don't need to change anything below this line.
-
 PROG_VERSION	:= $(shell git describe --abbrev=4 --dirty --always --tags)
 PLATFORM	:= $(shell uname -s | tr 'a-z' 'A-Z')
 
 INCLUDE 	:= -I. -I../../lib
 CDEFS 		:= -DPROG_VERSION=\"${PROG_VERSION}\"
+
+# Comment this out if you don't have a p-state invariant TSC
+#
+CDEFS 		+= -DHAVE_TSC=__amd64__
 
 ifneq ($(wildcard /usr/include/tirpc/rpc/rpc.h),)
 	INCLUDE := -I/usr/include/tirpc ${INCLUDE}

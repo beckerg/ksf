@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Greg Becker.  All rights reserved.
+ * Copyright (c) 2019,2022 Greg Becker.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -131,6 +131,7 @@ struct clreq {
  * send queue which serializes outgoing reply messages.
  */
 struct conn_priv {
+    __aligned(CACHE_LINE_SIZE * 2)
     struct mbuf    *frag;
     struct mbuf    *last;
     struct mbuf    *mcall;

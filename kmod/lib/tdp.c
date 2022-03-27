@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019 Greg Becker.  All rights reserved.
+ * Copyright (c) 2019,2022 Greg Becker.  All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
  * modification, are permitted provided that the following conditions
@@ -60,6 +60,7 @@ STAILQ_HEAD(twhead, tpreq);
  * group whose threads can run on any vCPU).
  */
 struct tgroup {
+    __aligned(CACHE_LINE_SIZE * 2)
     struct mtx          mtx;
     struct twhead       head;
     u_long              callbacks;
@@ -69,6 +70,7 @@ struct tgroup {
     uint16_t            tdcnt;
     uint16_t            tdmax;
 
+    __aligned(CACHE_LINE_SIZE)
     struct cv           cv;
     uint16_t            tdmin;
     u_long              grows;
@@ -76,11 +78,11 @@ struct tgroup {
 
     struct tpool       *tpool;
     struct tdargs       tdargs;
-} __aligned(CACHE_LINE_SIZE);
+};
 
 /* A thread pool exists for the purpose of asynchronous task
- * execution that requiring kthread context.  It is comprised
- * of one or more thread groups, where there is one thread
+ * execution requiring kthread context.  It is comprised of
+ * one or more thread groups, where there is one thread
  * group for each core.
  */
 struct tpool {
@@ -129,7 +131,10 @@ tpool_kthread_add(struct tdargs *tdargs)
     thread_lock(td);
     sched_prio(td, tdargs->prio);
     sched_add(td, SRQ_BORING);
+
+#if (__FreeBSD__ < 13)
     thread_unlock(td);
+#endif
 
     return 0;
 }

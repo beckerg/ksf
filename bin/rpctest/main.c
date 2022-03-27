@@ -55,6 +55,7 @@
 
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 
 #include <rpc/types.h>
@@ -78,6 +79,10 @@
 #define CACHE_LINE_SIZE     (64)
 #define cpuset_t            cpu_set_t
 
+#if HAVE_TSC
+#define __rdtsc()           __builtin_ia32_rdtsc()
+#endif
+
 #define CPU_COPY(_src, _dst)        \
 do {                                \
     CPU_ZERO((_dst));               \
@@ -97,7 +102,7 @@ strlcat(char *dst, const char *src, size_t dstsize)
  * MSGSZ_MAX   Max rx/tx message size
  */
 #define SPALIGN             (1024 * 1024 * 2ul)
-#define BKTV_MAX            (1024 * 1024 * 16ul)
+#define BKTV_MAX            (1024 * 1024 * 8ul)
 #define MSGINF_MAX          (1024)
 #define MSGSZ_MAX           (128)
 #define NFS3_NULL           (0)
@@ -138,10 +143,12 @@ FILE *eprint_fp;
 pthread_barrier_t bar_start;
 pthread_barrier_t bar_end;
 long duration = 600;
-u_int itermax = UINT_MAX;
+u_int itermax = 99;
 u_int jobs = 1;
 bool headers = true;
 bool fragged = false;
+bool xstats = false;
+bool runavg = false;
 in_port_t port = 62049;
 enum_t auth_flavor;
 char *auth_type = "none";
@@ -155,8 +162,9 @@ double quantilev[16];
 char *quantiles;
 int quantilec;
 
-u_long msgcnt __read_mostly;
+size_t msglen __read_mostly;
 size_t msginf __read_mostly;
+u_long msgcnt __read_mostly;
 uint tsc_scale __read_mostly;
 uint64_t tsc_freq __read_mostly;
 
@@ -201,8 +209,10 @@ static clp_option_t optionv[] = {
     CLP_OPTION(bool, 'H', headers, NULL, NULL, "suppress headers"),
     CLP_OPTION(u_int, 'i', itermax, NULL, NULL, "max iterations"),
     CLP_OPTION(u_int, 'j', jobs, NULL, NULL, "max number of threads/connections"),
+    CLP_OPTION(bool, 'm', runavg, NULL, NULL, "show running average rather than running median"),
     CLP_OPTION(string, 'q', quantiles, NULL, NULL, "comma-separated list of quantiles"),
     CLP_OPTION(bool, 'u', udp, NULL, NULL, "use UDP"),
+    CLP_OPTION(bool, 'x', xstats, NULL, NULL, "show extended statistics"),
     CLP_OPTION_END
 };
 
@@ -211,10 +221,6 @@ cycles2nsecs(uint64_t cycles)
 {
     return cycles * nsecspercycle;
 }
-
-#if HAVE_TSC && __linux__
-#define __rdtsc()   __builtin_ia32_rdtsc()
-#endif
 
 /* Record the start time for a time stamp interval measurement.
  */
@@ -623,7 +629,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
                 break;
             }
 
-            eprint(0, "recv: recmark cc %ld short read", cc);
+            eprint(EIO, "recv: recmark cc %ld short read", cc);
             rc = EIO;
             break;
         }
@@ -638,7 +644,7 @@ nullproc_sync(int fd, struct tdargs *tdargs)
                 break;
             }
 
-            eprint(0, "recv: cc %ld short read, expected %u", cc, rmlen);
+            eprint(EIO, "recv: cc %ld short read, expected %u", cc, rmlen);
             rc = EIO;
             break;
         }
@@ -648,12 +654,12 @@ nullproc_sync(int fd, struct tdargs *tdargs)
         stat = rpc_decode(&xdr, &rmsg, &rerr);
 
         if (stat != RPC_SUCCESS) {
-            eprint(0, "recv: msgrx %ld, stat %d", msgrx, stat);
+            eprint(EINVAL, "recv: msgrx %ld, stat %d", msgrx, stat);
             break;
         }
 
         if (rmsg.rm_xid != msgrx) {
-            eprint(0, "recv: invalid xid %u, msgrx %ld", rmsg.rm_xid, msgrx);
+            eprint(EINVAL, "recv: invalid xid %u, msgrx %ld", rmsg.rm_xid, msgrx);
             break;
         }
 
@@ -684,18 +690,18 @@ run(void *arg)
     int fd, rc;
     tsi_t tsi;
 
-#if 0
-    cpuset_t cpuset;
+    if (jobs < 6) {
+        cpuset_t cpuset;
 
-    CPU_ZERO(&cpuset);
-    CPU_SET(tdargs->cpu, &cpuset);
+        CPU_ZERO(&cpuset);
+        CPU_SET(tdargs->cpu, &cpuset);
 
-    rc = pthread_setaffinity_np(tdargs->td, sizeof(cpuset), &cpuset);
-    if (rc) {
-        eprint(errno, "pthread_setaffinity_np");
-        abort();
+        rc = pthread_setaffinity_np(tdargs->td, sizeof(cpuset), &cpuset);
+        if (rc) {
+            eprint(errno, "pthread_setaffinity_np");
+            abort();
+        }
     }
-#endif
 
     /* Reschedule to ensure we awaken on the desired CPU...
      */
@@ -711,6 +717,14 @@ run(void *arg)
     if (rc) {
         eprint(errno, "connect");
         abort();
+    }
+
+    if (msginf == 1) {
+        int optval = 1;
+
+        rc = setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &optval, sizeof(optval));
+        if (rc)
+            eprint(errno, "setsockopt(TCP_NODELAY)");
     }
 
     rxbufsz = roundup(MSGSZ_MAX, 4096) * 2;
@@ -760,6 +774,26 @@ run(void *arg)
     pthread_exit(NULL);
 }
 
+static int
+doublecmp(const void *lhs, const void *rhs)
+{
+    if (*(const double *)lhs < *(const double *)rhs)
+        return -1;
+    if (*(const double *)lhs > *(const double *)rhs)
+        return 1;
+    return 0;
+}
+
+static int
+uint64cmp(const void *lhs, const void *rhs)
+{
+    if (*(const uint64_t *)lhs < *(const uint64_t *)rhs)
+        return -1;
+    if (*(const uint64_t *)lhs > *(const uint64_t *)rhs)
+        return 1;
+    return 0;
+}
+
 static bool
 given(int c)
 {
@@ -778,11 +812,14 @@ main(int argc, char **argv)
     struct hostent *hent;
     char *server, *user;
     u_int loops;
+    int latprec;
+    long nsecs;
     int i;
 
     u_int cpu_count, cpu_offset, cpu_step;
     cpuset_t cpuset;
 
+    uint64_t *elapsedv, *latencyv;
     char *quantilebase;
     char errbuf[128];
     char state[256];
@@ -855,11 +892,13 @@ main(int argc, char **argv)
         return 0;
 
     nsecspercycle = 1000000000.0 / tsc_freq;
-    tsc_scale += (tsc_freq / 1000000000);
+    tsc_scale += (tsc_freq / 1000000000) + (jobs > 2);
 
-    dprint(1, "tsc_freq %lu, tsc_scale %u, nsecs/cycle %lf, sampleres %luns\n",
-           tsc_freq, tsc_scale, nsecspercycle,
-           ((1ul << tsc_scale) * 1000000000ul) / tsc_freq);
+    nsecs = cycles2nsecs(1u << tsc_scale);
+    latprec = (nsecs < 10) ? 2 : (nsecs < 100 ? 1 : 0);
+
+    dprint(1, "tsc_freq %lu, tsc_scale %u, nsecs/cycle %lf, histres %luns\n",
+           tsc_freq, tsc_scale, nsecspercycle, nsecs);
 
     if (quantiles) {
         char *buf = quantiles;
@@ -888,11 +927,6 @@ main(int argc, char **argv)
                 eprint(EINVAL, "unable to convert percentile `%s'", tok);
                 exit(EX_DATAERR);
             }
-            if (n > 0 && quantilev[n] < quantilev[n - 1]) {
-                eprint(EINVAL, "percentile %lf is smaller than preceding percentile",
-                       quantilev[n]);
-                exit(EX_DATAERR);
-            }
             if (quantilev[n] < 0 || quantilev[n] > 100) {
                 eprint(EINVAL, "percentile %lf is less than 0 or greater than 100",
                        quantilev[n]);
@@ -900,7 +934,7 @@ main(int argc, char **argv)
             }
         }
 
-        // TODO: sort list...
+        qsort(quantilev, quantilec, sizeof(quantilev[0]), doublecmp);
     }
 
     argc -= optind;
@@ -949,6 +983,13 @@ main(int argc, char **argv)
     serverip[sizeof(serverip) - 1] = '\000';
     faddr.sin_addr.s_addr = inet_addr(serverip);
 
+    elapsedv = malloc(sizeof(elapsedv[0]) * itermax * jobs);
+    latencyv = malloc(sizeof(latencyv[0]) * itermax);
+    if (!elapsedv || !latencyv) {
+        eprint(errno, "malloc elapsedv/latencyv");
+        exit(1);
+    }
+
     if (msgcnt < 1)
         msgcnt = 1;
     if (msginf >= MSGINF_MAX)
@@ -968,12 +1009,14 @@ main(int argc, char **argv)
         exit(EX_USAGE);
     }
 
-    if (verbosity > 0) {
+    if (1) {
         char msgbuf[128];
 
         rc = rpc_encode(msgcnt, NFS3_NULL, auth, msgbuf, sizeof(msgbuf));
         dprint(1, "sizeof(rpc_msg) %zu, sizeof(call_body) %zu, authtype auth%s, rpclen %d\n",
                sizeof(struct rpc_msg), sizeof(struct call_body), auth_type, rc);
+
+        msglen = roundup(rc, 32);
     }
 
     rc = pthread_barrier_init(&bar_start, NULL, jobs + 1);
@@ -998,6 +1041,7 @@ main(int argc, char **argv)
     /* Find a stepping that will evenly distribute workers across cores...
      */
     cpu_count = CPU_COUNT(&cpuset);
+    cpu_offset = 0;
     cpu_step = 1;
 
     for (i = 3; i < cpu_count; ++i) {
@@ -1007,18 +1051,16 @@ main(int argc, char **argv)
         }
     }
 
-    uint64_t elapsed_min, elapsed_max, elapsed_avg;
-    size_t bytes_total;
-    long iters_total;
+    uint64_t elapsed_min, elapsed_max, elapsed_med;
+    uint64_t elapsed_medv[jobs];
 
-    char latmaxbuf[jobs * 16], *latmaxcomma;
+    char latmaxbuf[jobs * 16 + 32], *latmaxcomma;
     int msgcntwidth, maxwidth;
-    u_long jmin, jmax, j;
-    long nsecs;
+    u_long jmax, j;
 
     msgcntwidth = snprintf(NULL, 0, "%lu", msgcnt * jobs);
-    if (msgcntwidth < 7)
-        msgcntwidth = 7;
+    if (msgcntwidth < 8)
+        msgcntwidth = 8;
 
     maxwidth = 8;
     loops = 0;
@@ -1030,13 +1072,13 @@ main(int argc, char **argv)
         abort();
     }
 
-    cpu_offset = (__rdtsc() / 1000) % cpu_count;
-    jmin = BKTV_MAX, jmax = 0;
+    //cpu_offset = (__rdtsc() / 1000) % cpu_count;
     accum = tdargv + jobs;
     latmaxbuf[0] = '\000';
-    latmaxcomma = "*  ";
+    latmaxcomma = "  ";
     elapsed_min = UINT64_MAX;
     elapsed_max = 0;
+    jmax = 0;
 
     /* Allocate storage for the accumulator's histogram...
      */
@@ -1072,6 +1114,8 @@ main(int argc, char **argv)
         }
     }
 
+    ++cpu_offset;
+
     /* Release the hounds!
      */
     rc = pthread_barrier_wait(&bar_start);
@@ -1084,6 +1128,7 @@ main(int argc, char **argv)
      */
     for (i = 0; i < jobs; ++i) {
         struct tdargs *tdargs = tdargv + i;
+        u_long jlast;
         void *val;
 
         rc = pthread_join(tdargs->td, &val);
@@ -1112,6 +1157,8 @@ main(int argc, char **argv)
             elapsed_min = tdargs->elapsed;
         if (tdargs->elapsed > elapsed_max)
             elapsed_max = tdargs->elapsed;
+        elapsed_medv[i] = cycles2nsecs(tdargs->elapsed);
+        elapsedv[loops * jobs + i] = elapsed_medv[i];
 
         /* Accumulate results from all workers into tdargv[jobs]...
          */
@@ -1121,47 +1168,52 @@ main(int argc, char **argv)
         accum->rx_eagain += tdargs->rx_eagain;
         accum->tx_eagain += tdargs->tx_eagain;
 
-        for (j = 0; j < BKTV_MAX; ++j) {
+        for (j = jlast = 0; j < BKTV_MAX; ++j) {
             if (tdargs->bktv[j] > 0) {
                 accum->bktv[j] += tdargs->bktv[j];
-
-                if (j > jmax)
-                    jmax = j + 1;
-                if (j < jmin)
-                    jmin = j;
+                jlast = j;
             }
         }
+
+        if (jlast > jmax)
+            jmax = jlast;
     }
 
-    bytes_total = accum->bytes;
-    iters_total = accum->iters;
-    elapsed_min = cycles2nsecs(elapsed_min) / 1000;
-    elapsed_max = cycles2nsecs(elapsed_max) / 1000;
-    elapsed_avg = cycles2nsecs(accum->elapsed) / (jobs * 1000);
-
     char buf[quantilec * 16 + 128];
-    u_long qcyclesv[quantilec];
-    u_long qhitsv[quantilec];
+    u_long qcyclesv[quantilec], q999cycles, q50cycles;
+    u_long qhitsv[quantilec], q999hits, q50hits;
     u_long first, last, n;
     int qcyclesvmin;
 
     /* Set qhitsv[i] to the percent of total hits required to reach quantilev[i]..
      */
     for (i = 0; i < quantilec; ++i) {
-        qhitsv[i] = (iters_total * quantilev[i]) / 100;
+        qhitsv[i] = (accum->iters * quantilev[i]) / 100;
         qcyclesv[i] = 0;
     }
 
+    q999hits = (accum->iters * 999) / 1000;
+    q50hits = (accum->iters * 50) / 100;
+    q999cycles = q50cycles = 0;
     first = last = n = 0;
     qcyclesvmin = 0;
 
     /* Find quantiles...
      */
-    for (j = jmin; j < jmax + 1; ++j) {
+    for (j = 0; j < jmax + 1; ++j) {
         if (accum->bktv[j] == 0)
             continue;
 
         n += accum->bktv[j];
+
+        if (n >= q999hits) {
+            q999hits = ULONG_MAX;
+            q999cycles = j;
+        }
+        if (n >= q50hits) {
+            q50hits = ULONG_MAX;
+            q50cycles = j;
+        }
 
         if (first == 0)
             first = j;
@@ -1178,48 +1230,92 @@ main(int argc, char **argv)
         }
     }
 
+    elapsed_min = cycles2nsecs(elapsed_min);
+    elapsed_max = cycles2nsecs(elapsed_max);
+
+    qsort(elapsed_medv, jobs, sizeof(elapsed_medv[0]), uint64cmp);
+    elapsed_med = elapsed_medv[jobs / 2];
+
+    latencyv[loops] = cycles2nsecs(q50cycles << tsc_scale);
+    qsort(latencyv, loops + 1, sizeof(latencyv[0]), uint64cmp);
+    qsort(elapsedv, (loops + 1) * jobs, sizeof(elapsedv[0]), uint64cmp);
+
     if (headers) {
         n = snprintf(buf, sizeof(buf),
-                     "%10s %3s %4s %*s %7s %7s %8s %8s %6s %7s",
-                     "DATE", "TD", "INF",
-                     msgcntwidth + 1, "MSGCNT",
-                     "MINTIME", "MAXTIME",
-                     "MINMSG", "MAXMSG",
-                     "Mbps", "MINLAT");
+                     "%10s %3s %4s %8s %6s %7s %7s",
+                     "Date", "TD", "INF",
+                     runavg ? "AvgRPC" : "MedRPC",
+                     runavg ? "AvgLat" : "MedLat",
+                     "Mbps", "MinLat");
 
         for (i = 0; i < quantilec; ++i) {
             const char *fmt = " %7.1lf";
 
-            if (quantilev[i] > 49.999 && quantilev[i] < 50.001)
-                fmt = "     MED";
-            else if ((long)(quantilev[i] * 1000) % 1000 == 0)
+            if ((long)(quantilev[i] * 1000) % 1000 == 0)
                 fmt = " %7.0lf";
 
             n += snprintf(buf + n, sizeof(buf) - n, fmt, quantilev[i]);
         }
 
-        printf("%s %*s\n", buf, maxwidth, "MAXLAT");
+        printf("%s %*s ", buf, maxwidth, "MaxLat");
+
+        if (xstats) {
+            printf(" %*s %8s %8s %8s %8s %8s %8s",
+                   msgcntwidth + 1, "TotalRPC",
+                   "MinTime", "MedTime", "MaxTIme",
+                   "MinRPC", "MedRPC", "MaxRPC");
+        }
+
+        printf("\n");
         headers = false;
     }
 
+    /* Use the cumulative median elapsed/latency values by default.
+     * Use the cumulative average if requested by the -A option.
+     */
+    uint64_t elapsed_ns = elapsedv[(loops + 1) * jobs / 2];
+    uint64_t latency_ns = latencyv[loops / 2];
+
+    if (runavg) {
+        elapsed_ns = latency_ns = 0;
+        for (i = 0; i < (loops + 1) * jobs; ++i)
+            elapsed_ns += elapsedv[i];
+        elapsed_ns /= (loops + 1) * jobs;
+
+        for (i = 0; i < (loops + 1); ++i)
+            latency_ns += latencyv[i];
+        latency_ns /= (loops + 1);
+    }
+
     n = snprintf(buf, sizeof(buf),
-                 "%10ld %3u %4zu %*ld %7.3lf %7.3lf %8lu %8lu %6.1lf %7.1lf",
+                 "%10ld %3u %4zu %8lu %6.*lf %7.1lf %7.*lf",
                  time(NULL), jobs, msginf,
-                 msgcntwidth + 1, iters_total,
-                 elapsed_min / 1000000.0, elapsed_max / 1000000.0,
-                 (iters_total * 1000000) / elapsed_max,
-                 (iters_total * 1000000) / elapsed_min,
-                 (double)bytes_total / elapsed_avg,
-                 cycles2nsecs(first << tsc_scale) / 1000.0);
+                 (accum->iters * 1000000000ul) / elapsed_ns,
+                 latprec, latency_ns / 1000.0,
+                 (accum->bytes * 8 * 1000.0) / elapsed_med,
+                 latprec, cycles2nsecs(first << tsc_scale) / 1000.0);
 
     for (i = 0; i < quantilec; ++i)
-        n += snprintf(buf + n, sizeof(buf) - n, " %7.1lf",
-                      cycles2nsecs(qcyclesv[i] << tsc_scale) / 1000.0);
+        n += snprintf(buf + n, sizeof(buf) - n, " %7.*lf",
+                      latprec, cycles2nsecs(qcyclesv[i] << tsc_scale) / 1000.0);
 
-    printf("%s %*.1lf%s\n",
-           buf, maxwidth,
+    printf("%s %*.*lf%s",
+           buf, maxwidth, latprec,
            cycles2nsecs(last << tsc_scale) / 1000.0,
-           latmaxbuf);
+           latmaxbuf[0] ? "*" : " ");
+
+    if (xstats) {
+        printf(" %*ld %8.3lf %8.3lf %8.3lf %8lu %8lu %8lu",
+               msgcntwidth + 1, accum->iters,
+               elapsed_min / 1000000000.0,
+               elapsed_med / 1000000000.0,
+               elapsed_max / 1000000000.0,
+               (accum->iters * 1000000000ul) / elapsed_min,
+               (accum->iters * 1000000000ul) / elapsed_med,
+               (accum->iters * 1000000000ul) / elapsed_max);
+    }
+
+    printf(" %s\n", latmaxbuf);
     fflush(stdout);
 
     if (datadir) {
@@ -1235,9 +1331,15 @@ main(int argc, char **argv)
 
         fp = fopen(datafile, "w");
         if (fp) {
-            for (j = jmin; j < jmax; ++j) {
+            fprintf(fp, "#%10s %10s", "CYCLES", "NSECS");
+            for (i = 0; i < jobs ; ++i)
+                fprintf(fp, " %*s%u", (i < 10) ? 8 : 7, "JOB", i);
+            fprintf(fp, " %9s\n", "TOTAL");
+
+            for (j = 0; j < jmax; ++j) {
                 if (accum->bktv[j] > 0) {
-                    fprintf(fp, "%12lu %12lu", j << tsc_scale, cycles2nsecs(j << tsc_scale));
+                    fprintf(fp, " %10lu %10lu",
+                            j << tsc_scale, cycles2nsecs(j << tsc_scale));
 
                     for (i = 0; i < jobs + 1; ++i)
                         fprintf(fp, " %9u", tdargv[i].bktv[j]);
@@ -1253,17 +1355,15 @@ main(int argc, char **argv)
                 const char *ylabel = "hits";
                 const char *color = "orange";
                 const char *term = "png";
-                u_long pctmin = first;
-                u_long pctmax = last;
+                u_long xmin, xmax;
 
-                if (quantilec > 1) {
-                    pctmax = qcyclesv[quantilec - 1];
-                    pctmin = qcyclesv[0];
-                }
-                pctmin = cycles2nsecs(pctmin << tsc_scale) / 1000;
-                pctmax = cycles2nsecs(pctmax << tsc_scale) / 1000;
-                if (pctmax > 1000)
-                    pctmax = 1000;
+                /* Clip the left x-axis to the first sample,
+                 * and the right x-axis to the 99.9 percentile.
+                 */
+                xmin = cycles2nsecs(first << tsc_scale) / 1000;
+                xmax = cycles2nsecs(q999cycles << tsc_scale) / 1000;
+                if (xmax - xmin > 1000)
+                    xmax = xmin + 1000;
 
                 fprintf(fp, "set title \"%s -j%u -a%zu -c%lu (loop %u)\"\n",
                         progname, jobs, msginf, msgcnt, loops);
@@ -1273,7 +1373,7 @@ main(int argc, char **argv)
                 fprintf(fp, "set grid\n");
                 fprintf(fp, "set xlabel \"%s\"\n", xlabel);
                 fprintf(fp, "set xtics autofreq\n");
-                fprintf(fp, "set xrange [%ld:%ld]\n", pctmin, pctmax);
+                fprintf(fp, "set xrange [%ld:%ld]\n", xmin, xmax);
                 fprintf(fp, "set ylabel \"%s\"\n", ylabel);
                 fprintf(fp, "set ytics autofreq\n");
                 fprintf(fp, "set tics front\n");
