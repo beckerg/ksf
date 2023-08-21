@@ -30,21 +30,23 @@ of a kernel thread.
 
 ### Hardware
 #### Client
-* Intel(R) Xeon(R) CPU E5-2690 v3 @ 2.60GHz (x1)
+* Intel(R) Xeon(R) CPU E5-2697a v4 @ 2.60GHz (16 cores)
 * cc0: t6nex0 <Chelsio T62100-SO-CR> (direct wired)
 * ix0: <Intel(R) PRO/10GbE PCI-Express> (direct wired)
 * igb0: <Intel(R) PRO/1000
-* [Supermicro SYS-6028R-TRT] https://www.supermicro.com/en/products/system/2U/6028/SYS-6028R-TRT.cfm
+* [Supermicro SYS-6028R-T] https://www.supermicro.com/en/products/system/2U/6028/SYS-6028R-T.cfm
 * X10DRi
 * FreeBSD 12.1-STABLE r362887 SM1 
+* FreeBSD 12.3-RELEASE SM1 
 
 #### Server
-* Intel(R) Xeon(R) CPU E5-2690 v3 @ 2.60GHz
+* Intel(R) Xeon(R) CPU E5-2697a v4 @ 2.60GHz (16 cores)
 * cc0: t6nex0 <Chelsio T62100-SO-CR> (direct wired)
 * ix0: <Intel(R) PRO/10GbE PCI-Express> (direct wired)
 * [Supermicro SYS-6028R-TRT] https://www.supermicro.com/products/system/2U/6028/SYS-6028R-TRT.cfm
 * X10DRi-T
 * FreeBSD 12.1-STABLE r362887 SM1 
+* FreeBSD 12.3-RELEASE SM1 
 
 ### Results
 
@@ -63,33 +65,130 @@ to encode each RPC call and decode/verify each RPC reply.
 
 * Median RTT latency in microseconds, single-threaded with at most one
 request in flight.
-For example: `sudo ./rpctest 10.100.0.1`
 
-  Gbe |      Client    |      Server    |  RTT  | RPC/s | Misc |
-  --- | -------------- | -------------- | ----- | ----- | ---- |
-  100 | cc0, E5-2690v3 | cc0, E5-2690v3 |  10.4 | 94833 |  toe |
-  100 | cc1, E5-2690v3 | cc1, E5-2690v3 |  12.7 | 78152 |      |
-   10 | ix0, E5-2690v3 | ix0, E5-2690v3 |  17.3 | 57397 |      |
+  For example: `sudo ./rpctest -j1 -a1 10.100.0.1`
+  
+  | Gbe |       Client     |       Server     |  RTT  |  RPC/s | Misc | FreeBSD |
+  | --- | ---------------- | ---------------- | ----- | ------ | ---- | ------- |
+  | 100 | cc0, E5-2690 v3  | cc0, E5-2690 v3  |  10.4 |  94833 |  toe | 12.1    |
+  | 100 | cc1, E5-2690 v3  | cc1, E5-2690 v3  |  12.7 |  78152 |      | 12.1    |
+  |  10 | ix0, E5-2690 v3  | ix0, E5-2690 v3  |  17.3 |  57397 |      | 12.1    |
+  |     |                  |                  |       |        |      |         |
+  | 100 | cc0, E5-2697A v4 | cc0, E5-2697A v4 |  11.0 |  73809 |  toe | 13.1    |
+  | 100 | cc1, E5-2697A v4 | cc1, E5-2697A v4 |  13.0 |  64500 |      | 13.1    |
+  |  10 | ix1, E5-2697A v4 | ix1, E5-2697A v4 |  18.2 |  45430 |      | 13.1    |
+
+  For example: `sudo ./rpctest -j1 -a1 10.100.0.1`
+  
+  | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
+  | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
+  | 100 |  cc0 |  28.2G | 77878.71 |   74170 |  11.5 |   12.3  | mtu 9000, toe |
+  | 100 |  cc1 |  47.7G | 47814.40 |   64599 |  14.7 |   12.3  |               |
+  |  10 |  ix1 |   9.4M |  9400.18 |   41213 |  19.7 |   12.3  |               |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 |   78255 |  11.3 |   13.1  | mtu 9000, toe |
+  | 100 |  cc1 |  13.4G | 13388.69 |   68704 |  13.5 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 |   49937 |  18.5 |   13.1  |               |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 |   74805 |  11.0 |   13.1  | mtu 9000, toe | patched
+  | 100 |  cc1 |  13.4G | 13388.69 |   69544 |  13.6 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 |   49937 |  18.5 |   13.1  |               |
+
+  For example: `sudo ./rpctest -j1 -a128 -c3M 10.100.0.1`
+  
+  | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
+  | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
+  | 100 |  cc0 |  28.2G | 77878.71 |  739787 | 171.6 |   12.3  | mtu 9000, toe |
+  | 100 |  cc1 |  47.7G | 47814.40 |  851050 | 147.7 |   12.3  |               |
+  |  10 |  ix1 |   9.4M |  9400.18 |  815816 | 149.7 |   12.3  |               |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 |  742753 | 169.6 |   13.1  | mtu 9000, toe |
+  | 100 |  cc1 |  13.4G | 13388.69 |  843484 | 150.3 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 |  839950 | 151.1 |   13.1  |               |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 |  742753 | 169.6 |   13.1  | mtu 9000, toe | patched
+  | 100 |  cc1 |  13.4G | 13388.69 |  843484 | 146.1 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 |  833722 | 148.1 |   13.1  |               |
+
+  For example: `sudo ./rpctest -j8 -a128 -c3M 10.100.0.1`
+  
+  | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
+  | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 | 4539636 | 212.6 |   13.1  | mtu 9000, toe |
+  | 100 |  cc1 |  13.4G | 13388.69 | 5905737 | 170.6 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 | 5786421 | 173.7 |   13.1  |               |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 | 4539636 | 212.6 |   13.1  | mtu 9000, toe | patched
+  | 100 |  cc1 |  13.4G | 13388.69 | 5925737 | 167.8 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 | 5786421 | 173.7 |   13.1  |               |
+
+  For example: `sudo ./rpctest -j16 -a128 -c3M 10.100.0.1`
+  
+  | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
+  | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
+  | 100 |  cc0 |  28.2G | 77878.71 |  178436 |  1237 |   12.3  | mtu 9000, toe |
+  | 100 |  cc1 |  47.7G | 47814.40 | 6881704 |   284 |   12.3  |               |
+  |  10 |  ix1 |   9.4M |  9400.18 | 6627787 |   269 |   12.3  |               |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 |  169680 | 16231 |   13.1  | mtu 9000, toe |
+  | 100 |  cc1 |  13.4G | 13388.69 | 9725407 |   191 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 | 8194687 |   204 |   13.1  |               |
+
+  For example: `sudo ./rpctest -j32 -a128 -c3M 10.100.0.1`
+  
+  | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
+  | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
+  | 100 |  cc0 |  28.2G | 77878.71 |    -    |    -  |   12.3  | mtu 9000, toe |
+  | 100 |  cc1 |  47.7G | 47814.40 | 6586226 |   533 |   12.3  |               |
+  |  10 |  ix1 |   9.4M |  9400.18 | 6677945 |   384 |   12.3  |               |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 |   -     |   -   |   13.1  | mtu 9000, toe |
+  | 100 |  cc1 |  13.4G | 13388.69 |13244111 |   271 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 |11096407 |   261 |   13.1  |               |
+  |     |      |        |          |         |       |         |               |
+  | 100 |  cc0 |  29.4G | 74383.80 |   -     |   -   |   13.1  | mtu 9000, toe | patched
+  | 100 |  cc1 |  13.4G | 13388.69 |13425250 |   264 |   13.1  |               |
+  |  10 |  ix1 |   9.4M |  9393.80 |10299950 |   251 |   13.1  |               |
+
 
 * Median RTT latency in microseconds, single-threaded with up to 128
 requests in flight.
-For example: `sudo ./rpctest -j1 -a128 -c9M 10.100.0.1`
 
-  Gbe |      Client    |      Server    |  RTT  |  RPC/s |  Misc |
-  --- | -------------- | -------------- | ----- | ------ | ----- |
-  100 | cc0, E5-2690v3 | cc0, E5-2690v3 | 163.5 | 665310 |  toe  |
-  100 | cc1, E5-2690v3 | cc1, E5-2690v3 | 167.0 | 731182 |       |
-   10 | ix0, E5-2690v3 | ix0, E5-2690v3 | 159.5 | 787885 |       |
+  For example: `sudo ./rpctest -j1 -a128 -c9M 10.100.0.1`
+  
+  | Gbe |       Client     |       Server     |  RTT  |  RPC/s  | Misc | FreeBSD |
+  | --- | ---------------- | ---------------- | ----- | ------- | ---- | ------- |
+  | 100 | cc0, E5-2690 v3  | cc0, E5-2690 v3  | 163.5 |  665310 |  toe | 12.1    |
+  | 100 | cc1, E5-2690 v3  | cc1, E5-2690 v3  | 167.0 |  731182 |      | 12.1    |
+  |  10 | ix0, E5-2690 v3  | ix0, E5-2690 v3  | 159.5 |  787885 |      | 12.1    |
+  |     |                  |                  |       |         |      |         |
+  | 100 | cc0, E5-2697A v4 | cc0, E5-2697A v4 | 139.1 |  918982 |  toe | 13.1    |
+  | 100 | cc1, E5-2697A v4 | cc1, E5-2697A v4 | 119.8 | 1062374 |      | 13.1    |
+  |  10 | ix1, E5-2697A v4 | ix1, E5-2697A v4 | 123.2 | 1037836 |      | 13.1    |
 
-* Median RTT latency in microseconds, eight threads with up to 128
+* Median RTT latency in microseconds, twelve threads with up to 224
 requests in flight (per thread).
-For example: `sudo ./rpctest -j12 -a224 -c9M 10.100.0.1`
 
-  Gbe |       Client   |      Server    |  RTT  |  RPC/s  |  Misc |
-  --- | -------------- | -------------- | ----- | ------- | ----- |
-  100 | cc0, E5-2690v3 | cc0, E5-2690v3 | 413.2 | 6259603 |  toe  |
-  100 | cc1, E5-2690v3 | cc1, E5-2690v3 | 383.7 | 5240423 |       |
-   10 | ix0, E5-2690v3 | ix0, E5-2690v3 | 343.1 | 4761223 |       |
+  For example: `sudo ./rpctest -j12 -a224 -c9M 10.100.0.1`
+  
+  | Gbe |       Client     |       Server     |  RTT  |   RPC/s  | Misc | FreeBSD |
+  | --- | ---------------- | ---------------- | ----- | -------- | ---- | ------- |
+  | 100 | cc0, E5-2690 v3  | cc0, E5-2690 v3  | 413.2 |  6259603 |  toe | 12.1    |
+  | 100 | cc1, E5-2690 v3  | cc1, E5-2690 v3  | 383.7 |  5240423 |      | 12.1    |
+  |  10 | ix0, E5-2690 v3  | ix0, E5-2690 v3  | 343.1 |  4761223 |      | 12.1    |
+  |     |                  |                  |       |          |      |         |
+  | 100 | cc0, E5-2697A v4 | cc0, E5-2697A v4 | 356.2 |  4311268 |  toe | 13.1    |
+  | 100 | cc1, E5-2697A v4 | cc1, E5-2697A v4 | 263.6 |  9733830 |      | 13.1    |
+  |  10 | ix1, E5-2697A v4 | ix1, E5-2697A v4 | 252.5 | 10471898 |      | 13.1    |
+
+  And: `sudo ./rpctest -j32 -a128 -c9M 10.100.0.1`
+  
+  | Gbe |       Client     |       Server     |  RTT  |   RPC/s  | Misc | FreeBSD |
+  | --- | ---------------- | ---------------- | ----- | -------- | ---- | ------- |
+  | 100 | cc0, E5-2697A v4 | cc0, E5-2697A v4 | 356.2 |  4311268 |  toe | 13.1    |
+  | 100 | cc1, E5-2697A v4 | cc1, E5-2697A v4 | 263.6 |  9733830 |      | 13.1    |
+  |  10 | ix1, E5-2697A v4 | ix1, E5-2697A v4 | 252.5 | 10471898 |      | 13.1    |
 
 Note that the *RTT* and *RPC/s* columns are the median of the all results
 over 99 runs (each of which is the median of all jobs within the run).
@@ -128,7 +227,7 @@ the following patch to avoid a kernel panic on svn versions lower than
 
 ### Configuration
 
-#### /etc/sysctl.conf
+#### /etc/sysctl.conf.local
 
 ```
 net.inet.raw.maxdgram=16384
@@ -154,7 +253,7 @@ dev.t6nex.0.toe.ddp=1
 dev.t6nex.0.toe.tx_zcopy=1
 ```
 
-#### /etc/rc.conf
+#### /etc/rc.conf.local
 ```
 powerd_enable="YES"
 powerd_flags="-n hiadaptive -a hiadaptive -p333 -i35 -r65"
@@ -169,7 +268,7 @@ ifconfig_ix0="inet 10.10.0.1 netmask 255.255.255.0 -tso -lro -vlanhwtso"
 ifconfig_ix1="inet 10.10.1.1 netmask 255.255.255.0 -tso -lro -vlanhwtso"
 ```
 
-#### /boot/loader.conf
+#### /boot/loader.conf.local
 
 ```
 cc_htcp_load="YES"

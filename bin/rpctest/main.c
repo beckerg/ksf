@@ -1082,7 +1082,7 @@ main(int argc, char **argv)
 
     /* Allocate storage for the accumulator's histogram...
      */
-    accum->spbufsz = sizeof(accum->bktv[0] * BKTV_MAX);
+    accum->spbufsz = sizeof(accum->bktv[0]) * BKTV_MAX;
     accum->spbuf = spalloc(accum->spbufsz);
     if (!accum->spbuf) {
         eprint(errno, "spalloc accum");
