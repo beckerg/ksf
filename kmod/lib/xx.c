@@ -96,9 +96,9 @@ xx_modevent(module_t mod, int cmd, void *data)
 }
 
 static moduledata_t xx_mod = {
-    KSF_MOD_NAME,
-    xx_modevent,
-    NULL,
+    .name = KSF_MOD_NAME,
+    .evhand = xx_modevent,
+    .priv = NULL,
 };
 
 DECLARE_MODULE(KSF_MOD, xx_mod, SI_SUB_EXEC, SI_ORDER_ANY);

@@ -66,7 +66,7 @@ to encode each RPC call and decode/verify each RPC reply.
 * Median RTT latency in microseconds, single-threaded with at most one
 request in flight.
 
-  For example: `sudo ./rpctest -j1 -a1 10.100.0.1`
+  `sudo ./rpctest -j1 -a1 10.100.0.1`
   
   | Gbe |       Client     |       Server     |  RTT  |  RPC/s | Misc | FreeBSD |
   | --- | ---------------- | ---------------- | ----- | ------ | ---- | ------- |
@@ -78,7 +78,7 @@ request in flight.
   | 100 | cc1, E5-2697A v4 | cc1, E5-2697A v4 |  13.0 |  64500 |      | 13.1    |
   |  10 | ix1, E5-2697A v4 | ix1, E5-2697A v4 |  18.2 |  45430 |      | 13.1    |
 
-  For example: `sudo ./rpctest -j1 -a1 10.100.0.1`
+  `sudo ./rpctest -j1 -a1 10.100.0.1`
   
   | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
   | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
@@ -93,6 +93,21 @@ request in flight.
   | 100 |  cc0 |  29.4G | 74383.80 |   74805 |  11.0 |   13.1  | mtu 9000, toe | patched
   | 100 |  cc1 |  13.4G | 13388.69 |   69544 |  13.6 |   13.1  |               |
   |  10 |  ix1 |   9.4M |  9393.80 |   49937 |  18.5 |   13.1  |               |
+
+* Median RTT latency in microseconds, single-threaded with up to 128
+requests in flight.
+
+  `sudo ./rpctest -j1 -a128 -c9M 10.100.0.1`
+  
+  | Gbe |       Client     |       Server     |  RTT  |  RPC/s  | Misc | FreeBSD |
+  | --- | ---------------- | ---------------- | ----- | ------- | ---- | ------- |
+  | 100 | cc0, E5-2690 v3  | cc0, E5-2690 v3  | 163.5 |  665310 |  toe | 12.1    |
+  | 100 | cc1, E5-2690 v3  | cc1, E5-2690 v3  | 167.0 |  731182 |      | 12.1    |
+  |  10 | ix0, E5-2690 v3  | ix0, E5-2690 v3  | 159.5 |  787885 |      | 12.1    |
+  |     |                  |                  |       |         |      |         |
+  | 100 | cc0, E5-2697A v4 | cc0, E5-2697A v4 | 139.1 |  918982 |  toe | 13.1    |
+  | 100 | cc1, E5-2697A v4 | cc1, E5-2697A v4 | 119.8 | 1062374 |      | 13.1    |
+  |  10 | ix1, E5-2697A v4 | ix1, E5-2697A v4 | 123.2 | 1037836 |      | 13.1    |
 
   For example: `sudo ./rpctest -j1 -a128 -c3M 10.100.0.1`
   
@@ -110,7 +125,10 @@ request in flight.
   | 100 |  cc1 |  13.4G | 13388.69 |  843484 | 146.1 |   13.1  |               |
   |  10 |  ix1 |   9.4M |  9393.80 |  833722 | 148.1 |   13.1  |               |
 
-  For example: `sudo ./rpctest -j8 -a128 -c3M 10.100.0.1`
+* Median RTT latency in microseconds, 8 threads with up to 128
+requests in flight per thread.
+
+  `sudo ./rpctest -j8 -a128 -c3M 10.100.0.1`
   
   | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
   | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
@@ -123,7 +141,10 @@ request in flight.
   | 100 |  cc1 |  13.4G | 13388.69 | 5925737 | 167.8 |   13.1  |               |
   |  10 |  ix1 |   9.4M |  9393.80 | 5786421 | 173.7 |   13.1  |               |
 
-  For example: `sudo ./rpctest -j16 -a128 -c3M 10.100.0.1`
+* Median RTT latency in microseconds, 16 threads with up to 128
+requests in flight per thread.
+
+  `sudo ./rpctest -j16 -a128 -c3M 10.100.0.1`
   
   | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
   | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
@@ -135,7 +156,10 @@ request in flight.
   | 100 |  cc1 |  13.4G | 13388.69 | 9725407 |   191 |   13.1  |               |
   |  10 |  ix1 |   9.4M |  9393.80 | 8194687 |   204 |   13.1  |               |
 
-  For example: `sudo ./rpctest -j32 -a128 -c3M 10.100.0.1`
+* Median RTT latency in microseconds, thirty two threads with up to 128
+requests in flight per thread.
+
+  `sudo ./rpctest -j32 -a128 -c3M 10.100.0.1`
   
   | Gbe | IFCE | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
   | --- | ---- | ------ | -------- | ------- | ----- | ------- | ------------- |
@@ -151,26 +175,10 @@ request in flight.
   | 100 |  cc1 |  13.4G | 13388.69 |13425250 |   264 |   13.1  |               |
   |  10 |  ix1 |   9.4M |  9393.80 |10299950 |   251 |   13.1  |               |
 
+* Median RTT latency in microseconds, 12 threads with up to 224
+requests in flight per thread.
 
-* Median RTT latency in microseconds, single-threaded with up to 128
-requests in flight.
-
-  For example: `sudo ./rpctest -j1 -a128 -c9M 10.100.0.1`
-  
-  | Gbe |       Client     |       Server     |  RTT  |  RPC/s  | Misc | FreeBSD |
-  | --- | ---------------- | ---------------- | ----- | ------- | ---- | ------- |
-  | 100 | cc0, E5-2690 v3  | cc0, E5-2690 v3  | 163.5 |  665310 |  toe | 12.1    |
-  | 100 | cc1, E5-2690 v3  | cc1, E5-2690 v3  | 167.0 |  731182 |      | 12.1    |
-  |  10 | ix0, E5-2690 v3  | ix0, E5-2690 v3  | 159.5 |  787885 |      | 12.1    |
-  |     |                  |                  |       |         |      |         |
-  | 100 | cc0, E5-2697A v4 | cc0, E5-2697A v4 | 139.1 |  918982 |  toe | 13.1    |
-  | 100 | cc1, E5-2697A v4 | cc1, E5-2697A v4 | 119.8 | 1062374 |      | 13.1    |
-  |  10 | ix1, E5-2697A v4 | ix1, E5-2697A v4 | 123.2 | 1037836 |      | 13.1    |
-
-* Median RTT latency in microseconds, twelve threads with up to 224
-requests in flight (per thread).
-
-  For example: `sudo ./rpctest -j12 -a224 -c9M 10.100.0.1`
+  `sudo ./rpctest -j12 -a224 -c9M 10.100.0.1`
   
   | Gbe |       Client     |       Server     |  RTT  |   RPC/s  | Misc | FreeBSD |
   | --- | ---------------- | ---------------- | ----- | -------- | ---- | ------- |
@@ -182,7 +190,7 @@ requests in flight (per thread).
   | 100 | cc1, E5-2697A v4 | cc1, E5-2697A v4 | 263.6 |  9733830 |      | 13.1    |
   |  10 | ix1, E5-2697A v4 | ix1, E5-2697A v4 | 252.5 | 10471898 |      | 13.1    |
 
-  And: `sudo ./rpctest -j32 -a128 -c9M 10.100.0.1`
+  `sudo ./rpctest -j32 -a128 -c9M 10.100.0.1`
   
   | Gbe |       Client     |       Server     |  RTT  |   RPC/s  | Misc | FreeBSD |
   | --- | ---------------- | ---------------- | ----- | -------- | ---- | ------- |
