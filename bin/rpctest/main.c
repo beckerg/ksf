@@ -690,7 +690,7 @@ run(void *arg)
     int fd, rc;
     tsi_t tsi;
 
-    if (jobs < 6) {
+    if (jobs < 16 /* fixme */) {
         cpuset_t cpuset;
 
         CPU_ZERO(&cpuset);
@@ -698,7 +698,7 @@ run(void *arg)
 
         rc = pthread_setaffinity_np(tdargs->td, sizeof(cpuset), &cpuset);
         if (rc) {
-            eprint(errno, "pthread_setaffinity_np");
+            eprint(errno, "pthread_setaffinity_np (cpu %d)", tdargs->cpu);
             abort();
         }
     }
@@ -816,7 +816,6 @@ main(int argc, char **argv)
     long nsecs;
     int i;
 
-    u_int cpu_count, cpu_offset, cpu_step;
     cpuset_t cpuset;
 
     uint64_t *elapsedv, *latencyv;
@@ -1032,25 +1031,6 @@ main(int argc, char **argv)
         eprint(errno, "unable to set priority");
     }
 
-    rc = pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
-    if (rc) {
-        eprint(errno, "pthread_getaffinity_np");
-        abort();
-    }
-
-    /* Find a stepping that will evenly distribute workers across cores...
-     */
-    cpu_count = CPU_COUNT(&cpuset);
-    cpu_offset = 0;
-    cpu_step = 1;
-
-    for (i = 3; i < cpu_count; ++i) {
-        if (cpu_count % i) {
-            cpu_step = i;
-            break;
-        }
-    }
-
     uint64_t elapsed_min, elapsed_max, elapsed_med;
     uint64_t elapsed_medv[jobs];
 
@@ -1066,13 +1046,18 @@ main(int argc, char **argv)
     loops = 0;
 
   again:
+    rc = pthread_getaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+    if (rc) {
+        eprint(errno, "pthread_getaffinity_np");
+        abort();
+    }
+
     tdargv = calloc(jobs + 1, sizeof(*tdargv));
     if (!tdargv) {
         eprint(errno, "malloc tdargv %d", jobs);
         abort();
     }
 
-    //cpu_offset = (__rdtsc() / 1000) % cpu_count;
     accum = tdargv + jobs;
     latmaxbuf[0] = '\000';
     latmaxcomma = "  ";
@@ -1098,13 +1083,9 @@ main(int argc, char **argv)
         memcpy(&tdargs->faddr, &faddr, sizeof(tdargs->faddr));
         tdargs->job = i;
 
-        for (j = 0; j < cpu_count && jobs < cpu_count; ++j) {
-            int cpu = (cpu_offset + cpu_step * i) % cpu_count;
-
-            if (CPU_ISSET(cpu, &cpuset)) {
-                tdargs->cpu = cpu;
-                break;
-            }
+        if (CPU_COUNT(&cpuset) > 0) {
+            tdargs->cpu = CPU_FFS(&cpuset) - 1;
+            CPU_CLR(tdargs->cpu, &cpuset);
         }
 
         rc = pthread_create(&tdargs->td, NULL, run, tdargs);
@@ -1113,8 +1094,6 @@ main(int argc, char **argv)
             abort();
         }
     }
-
-    ++cpu_offset;
 
     /* Release the hounds!
      */
@@ -1133,7 +1112,7 @@ main(int argc, char **argv)
 
         rc = pthread_join(tdargs->td, &val);
         if (rc) {
-            eprint(rc, "pthread_join thread %u of %u", i, cpu_count);
+            eprint(rc, "pthread_join thread %u of %u", i, jobs);
             abort();
         }
 

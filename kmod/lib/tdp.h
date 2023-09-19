@@ -44,7 +44,7 @@ tpreq_init(struct tpreq *req, tpool_cb_t *func, void *arg)
     req->arg = arg;
 }
 
-void tpool_enqueue(struct tpool *tpool, struct tpreq *req, int cpu);
+void tpool_enqueue(struct tpool *tpool, struct tpreq *req, u_int cpu);
 
 struct tpool *tpool_create(u_int tdmin, u_int tdmax);
 void tpool_shutdown(struct tpool *tpool);
