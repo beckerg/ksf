@@ -1,5 +1,4 @@
-
-# Copyright (c) 2013,2016-2017,2019-2020 Greg Becker.  All rights reserved.
+# Copyright (c) 2013,2016-2017,2019-2020,2023 Greg Becker.  All rights reserved.
 
 KMOD    = krpc2
 
@@ -19,7 +18,9 @@ CLEANFILES += cscope.* TAGS ${KMOD}.objdump .depend.*.o
 CSCOPE_DIRS ?= . ${VPATH} /usr/src/lib /usr/src/sys
 CTAGS = true
 
-.PHONY:	clobber cscope debug distclean etags tags objdump
+.PHONY:	asan clobber cscope debug distclean etags msan tags objdump
+
+asan msan: all
 
 clobber: clean
 

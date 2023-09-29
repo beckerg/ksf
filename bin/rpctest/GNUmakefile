@@ -1,4 +1,4 @@
-# Copyright (c) 2011,2014-2017,2019 Greg Becker.  All rights reserved.
+# Copyright (c) 2011,2014-2017,2019,2023 Greg Becker.  All rights reserved.
 #
 # $Id: GNUmakefile 393 2016-04-14 09:21:59Z greg $
 
@@ -28,10 +28,13 @@ ifneq ($(wildcard /usr/include/tirpc/rpc/rpc.h),)
 endif
 
 CFLAGS		+= -Wall -g -O2 ${INCLUDE}
-CFLAGS		+= -march=native
 DEBUG		:= -O0 -DDEBUG -UNDEBUG -fno-omit-frame-pointer
 CPPFLAGS	:= ${CDEFS}
 OBJ		:= ${SRC:.c=.o}
+
+ifeq ($(shell echo "int main() { return 0; }" | ${CC} -xc  -march=native - 2>&1),)
+CFLAGS += -march=native
+endif
 
 CSCOPE_DIRS	?= \
 	. ${VPATH} \
@@ -57,6 +60,11 @@ asan: CFLAGS += ${DEBUG}
 asan: CFLAGS += -fsanitize=address -fsanitize=undefined
 asan: LDLIBS += -fsanitize=address -fsanitize=undefined
 asan: ${PROG}
+
+msan: CFLAGS += ${DEBUG}
+msan: CFLAGS += -fsanitize=memory -fsanitize-memory-track-origins
+msan: LDLIBS += -fsanitize=memory -fsanitize-memory-track-origins
+msan: ${PROG}
 
 clean:
 	rm -f ${PROG} ${OBJ} *.core

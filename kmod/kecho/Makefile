@@ -19,7 +19,9 @@ CLEANFILES += cscope.* TAGS ${KMOD}.objdump .depend.*.o
 CSCOPE_DIRS ?= . ${VPATH} /usr/src/lib /usr/src/sys
 CTAGS = true
 
-.PHONY:	clobber cscope debug distclean etags tags objdump
+.PHONY:	asan clobber cscope debug distclean etags msan tags objdump
+
+asan msan: all
 
 clobber: clean
 
