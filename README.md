@@ -63,35 +63,55 @@ and
 Measurements taken by *rpctest* are end-to-end and include the full time
 to encode each RPC call and decode/verify each RPC reply.
 
+* Standard uni-directional performance tests (iperf3, netperf).
+
+  | Gbe |  IFCE  | iperf3 |  netperf | FreeBSD |     Notes     |
+  | --- | ------ | ------ | -------- | ------- | ------------- |
+  | 100 |    cc0 |  29.2G | 91553.80 |   15.x  | mtu 9000, toe |
+  | 100 |    cc1 |  33.9G | 34463.69 |   15.x  |               |
+  |  40 | mlxen0 |  38.7G | 39223.91 |   15.x  | mtu 9000      |
+  |  40 | mlxen1 |  36.5G | 36342.42 |   15.x  |               |
+  |  10 |    ix0 |   9.9M |  9893.66 |   15.x  | mtu 9000      |
+  |  10 |    ix1 |   9.4M |  9403.33 |   15.x  |               |
+
 * Median RTT latency in microseconds, single-threaded with at most one
 request in flight.
 
   `sudo ./rpctest -j1 -a1 172.16.100.200`
   
-  | Gbe |  IFCE  | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
-  | --- | ------ | ------ | -------- | ------- | ----- | ------- | ------------- |
-  | 100 |    cc0 |  28.2G | 77878.71 |   74170 |  11.5 |   12.3  | mtu 9000, toe |
-  | 100 |    cc1 |  47.7G | 47814.40 |   64599 |  14.7 |   12.3  |               |
-  |  10 |    ix1 |   9.4M |  9400.18 |   41213 |  19.7 |   12.3  |               |
-  |     |        |        |          |         |       |         |               |
-  | 100 |    cc0 |  29.4G | 74383.80 |   78255 |  11.3 |   13.1  | mtu 9000, toe |
-  | 100 |    cc1 |  13.4G | 13388.69 |   68704 |  13.5 |   13.1  |               |
-  |  10 |    ix1 |   9.4M |  9393.80 |   49937 |  18.5 |   13.1  |               |
-  |     |        |        |          |         |       |         |               |
-  | 100 |    cc0 |  29.2G | 91553.80 |   97257 |  10.2 |   15.x  | mtu 9000, toe |
-  | 100 |    cc1 |  33.9G | 34463.69 |   73720 |  13.5 |   15.x  |               |
-  |  40 | mlxen0 |  38.7G | 39223.91 |   63760 |  15.7 |   15.x  | mtu 9000      |
-  |  40 | mlxen1 |  36.5G | 36342.42 |   63756 |  15.4 |   15.x  |               |
-  |  10 |    ix0 |   9.9M |  9893.66 |   51251 |  19.5 |   15.x  | mtu 9000      |
-  |  10 |    ix1 |   9.4M |  9403.33 |   52057 |  19.1 |   15.x  |               |
+  | Gbe |  IFCE  |  RPC/s  |  RTT  | FreeBSD |     Notes     |
+  | --- | ------ | ------- | ----- | ------- | ------------- |
+  | 100 |    cc0 |  101542 |   9.8 |   15.x  | mtu 9000, toe |
+  | 100 |    cc1 |   73720 |  13.5 |   15.x  |               |
+  | 100 |    cc0 |   97257 |  10.2 |   15.x  | mtu 9000, toe |
+  | 100 |    cc1 |   73720 |  13.5 |   15.x  |               |
+  |  40 | mlxen0 |   63760 |  15.7 |   15.x  | mtu 9000      |
+  |  40 | mlxen1 |   63756 |  15.4 |   15.x  |               |
+  |  10 |    ix0 |   51251 |  19.5 |   15.x  | mtu 9000      |
+  |  10 |    ix1 |   52057 |  19.1 |   15.x  |               |
 
 * Median RTT latency in microseconds, single-threaded with up to 128
 requests in flight.
 
   `sudo ./rpctest -j1 -a128 -c9M 172.16.100.200`
   
-  | Gbe |  IFCE  | iperf3 |  netperf |  RPC/s  |  RTT  | FreeBSD |     Notes     |
-  | --- | ------ | ------ | -------- | ------- | ----- | ------- | ------------- |
+  | Gbe |  IFCE  |  RPC/s  |  RTT  | FreeBSD |     Notes     |
+  | --- | ------ | ------- | ----- | ------- | ------------- |
+  | 100 |    cc0 |  866111 |       |   15.x  | mtu 9000, toe |
+  | 100 |    cc0 |  866111 |       |   15.x  | mtu 9000, toe |
+  | 100 |    cc0 |  790344 | 154.1 |   15.x  | mtu 9000, toe |
+  | 100 |    cc1 |  910236 | 140.6 |   15.x  |               |
+
+
+* Median RTT latency in microseconds, 16 threads with up to 128
+requests each in flight.
+
+  `sudo ./rpctest -j16 -a128 -c9M 172.16.100.200`
+  
+  | Gbe |  IFCE  |   RPC/s  |  RTT  | FreeBSD |     Notes     |
+  | --- | ------ | -------- | ----- | ------- | ------------- |
+  | 100 |    cc0 | 11203762 | 182.3 |   15.x  | mtu 9000, toe |
+  | 100 |    cc1 | 10782210 | 142.9 |   15.x  |               |
 
 
 Note that the *RTT* and *RPC/s* columns are the median of the all results
