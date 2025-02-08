@@ -275,7 +275,15 @@ svc_accept_tcp(struct tpreq *req)
 
     so->so_state |= nbio;
 
+#if __FreeBSD__ >= 15
+    laddr = malloc(sizeof(struct sockaddr_storage), M_SONAME, M_WAITOK | M_ZERO);
+    ((struct sockaddr_storage *)laddr)->ss_len = sizeof(struct sockaddr_storage);
+
+    rc = soaccept(so, laddr);
+#else
     rc = soaccept(so, &laddr);
+#endif
+
     if (rc) {
         eprint("soaccept: lsn %p, rc %d\n", lsn, rc);
         goto errout;
